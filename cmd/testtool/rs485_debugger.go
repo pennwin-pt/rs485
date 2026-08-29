@@ -99,8 +99,6 @@ func main() {
 
 	printBanner(addr, delaySeconds)
 
-	//StartTrapDetectionSystem(addr)
-
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
@@ -135,7 +133,7 @@ func main() {
 			runCardMode(scanner)
 
 		case modeCard1:
-			runCardMode1(scanner)
+			runCardModeOnce(scanner)
 
 		case modeSetWorkMode:
 			runSetWorkMode(addr, scanner)
@@ -231,44 +229,6 @@ func relayBitForChannel(channel byte) byte {
 	return 0x02 // M2
 }
 
-// queryRelayStatus 发送查询继电器状态指令（XX 02 00 01 00 03 + CRC16），
-// 返回回包状态字节（回包 6 字节数据 + 2 字节 CRC，状态值在 resp[5]）。
-// 注意：这条指令和 check05/check01 用的查询触发状态指令（XX 02 00 02 00 05）不是同一条，
-// 这里查的是继电器开关状态，与 rs485.go 里的 QueryRelayStatus 保持一致。
-func queryRelayStatus(addr string, deviceAddr byte) (byte, error) {
-	payload := mustBuildPayload(fmt.Sprintf("%02X 02 00 01 00 03", deviceAddr))
-	fmt.Printf("  → [查询] 目标 %s，发送：%s\n", addr, rs485.FormatHex(payload))
-
-	resp, err := sendAndReceive(addr, payload)
-	if err != nil {
-		return 0, fmt.Errorf("发送查询指令失败: %w", err)
-	}
-	if len(resp) < 6 {
-		return 0, fmt.Errorf("回包长度不足，收到 %d 字节：%s", len(resp), rs485.FormatHex(resp))
-	}
-	return resp[5], nil
-}
-
-// sendCommandOnly 只把指令发出去，不等待、不读取设备回包——用于开/关这类指令，
-// 硬件收到后不会有任何数据返回，如果还像 sendAndReceive 那样等 readTimeout 去读，
-// 纯粹是白白等待，没有意义。发送成功即返回 nil，只有连接/写入失败才算错误。
-// 对应另一工程 rs485.go 里的 SendFrame。
-func sendCommandOnly(addr string, payload []byte) error {
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
-	if err != nil {
-		return fmt.Errorf("连接 %s 失败: %w", addr, err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetWriteDeadline(time.Now().Add(readTimeout)); err != nil {
-		return err
-	}
-	if _, err := conn.Write(payload); err != nil {
-		return fmt.Errorf("发送失败: %w", err)
-	}
-	return nil
-}
-
 // sendChannelWithVerify 发送一次开/关指令后，隔 verifyQueryDelay 用 queryRelayStatus
 // 查一次硬件实际状态，确认是否变成了期望的 on/off；不符合预期就重新发送+重新查询，
 // 最多尝试 maxVerifyAttempts 次。逻辑与另一工程 rs485.go 里的同名函数完全对应。
@@ -299,7 +259,7 @@ func sendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool) 
 
 		time.Sleep(verifyQueryDelay)
 
-		status, err := queryRelayStatus(addr, deviceAddr)
+		status, err := rs485.QueryRelayStatus(addr, deviceAddr)
 		if err != nil {
 			lastErr = fmt.Errorf("第 %d/%d 次发送后查询硬件状态失败: %w", attempt, maxVerifyAttempts, err)
 			fmt.Printf("  ✗ [%s] 第 %d/%d 次查询状态失败：%v\n", action, attempt, maxVerifyAttempts, err)
@@ -388,9 +348,9 @@ func runCardMode(scanner *bufio.Scanner) {
 	runPresetCard(fmt.Sprintf("card%02X", deviceAddr), byte(deviceAddr))
 }
 
-// runPresetCard1 根据设备地址码从 motorReaderMap 找到对应读卡器，只发送并读取一次
+// runPresetCardOnce 根据设备地址码从 motorReaderMap 找到对应读卡器，只发送并读取一次
 // （不做 2 秒轮询），结束后打印本次是否命中以及读到的卡号。
-func runPresetCard1(presetName string, deviceAddr byte) {
+func runPresetCardOnce(presetName string, deviceAddr byte) {
 	fmt.Printf("\n【预设：%s】只读一次地址码 0x%02X 对应读卡器的卡号：\n", presetName, deviceAddr)
 	reader, ok := motorReaderMap[deviceAddr]
 	if !ok {
@@ -405,17 +365,17 @@ func runPresetCard1(presetName string, deviceAddr byte) {
 	}
 }
 
-// runCardMode1 是"只读一次"模式：用法与 runCardMode 一致——先输入 card1 进入本模式，
+// runCardModeOnce 是"只读一次"模式：用法与 runCardMode 一致——先输入 card1 进入本模式，
 // 再输入十六进制设备地址，回车后只发送并读取一次查询指令（不做 2 秒轮询），
 // 结束后打印本次是否命中以及读到的卡号。
-func runCardMode1(scanner *bufio.Scanner) {
+func runCardModeOnce(scanner *bufio.Scanner) {
 	fmt.Println("\n【只读一次模式】请输入十六进制设备地址（如 00、01、05），随后只发送并读取一次查询指令。")
 	deviceAddr := promptForCardAddress(scanner)
 	if deviceAddr < 0 {
 		fmt.Println("✗ 已取消操作。")
 		return
 	}
-	runPresetCard1(fmt.Sprintf("card1_%02X", deviceAddr), byte(deviceAddr))
+	runPresetCardOnce(fmt.Sprintf("card1_%02X", deviceAddr), byte(deviceAddr))
 }
 
 // promptForCardAddress 提示用户输入十六进制设备地址（0x00~0xFF，对应 motorReaderMap 的 key）。
@@ -572,24 +532,6 @@ func runOpenCloseSequence(addr string, openPayload, closePayload []byte, delaySe
 	fmt.Println("流程执行完毕。")
 }
 
-func printUsage() {
-	fmt.Println("RS485 TCP 指令发送工具")
-	fmt.Println()
-	fmt.Println("用法:")
-	fmt.Println("  rs485-debugger [设备IP[:端口]] [关闭延时秒数]")
-	fmt.Println()
-	fmt.Printf("默认目标地址：%s\n", defaultTarget)
-	fmt.Printf("默认关闭延时：%d 秒\n", defaultDelaySeconds)
-	fmt.Println()
-	fmt.Println("示例:")
-	fmt.Println("  rs485-debugger")
-	fmt.Println("  rs485-debugger 192.168.1.100")
-	fmt.Println("  rs485-debugger 192.168.2.170:8001 10")
-	fmt.Println()
-	fmt.Println("程序启动后，每一轮都会让你在下面这些模式里选一个：")
-	fmt.Println("  回车/1、2/s、up、down、check、card、card1、mode、verify、q/quit/exit（详见模式选择菜单）")
-}
-
 func printBanner(addr string, delaySeconds int) {
 	fmt.Println("========================================")
 	fmt.Println("  RS485 TCP 指令发送工具 + RFID读写器工作模式设置")
@@ -635,27 +577,11 @@ func buildPayloadWithCRC(s string) ([]byte, error) {
 		return nil, fmt.Errorf("必须为 %d 个字节（%d 个十六进制字符），当前 %d 个字节", payloadLen, payloadLen*2, len(data))
 	}
 
-	crc := crc16Modbus(data)
+	crc := rs485.Crc16Modbus(data)
 	payload := make([]byte, 0, payloadLen+2)
 	payload = append(payload, data...)
 	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
 	return payload, nil
-}
-
-// crc16Modbus 计算 Modbus RTU 常用的 CRC-16（多项式 0x8005，低字节在前）。
-func crc16Modbus(data []byte) uint16 {
-	var crc uint16 = 0xFFFF
-	for _, b := range data {
-		crc ^= uint16(b)
-		for i := 0; i < 8; i++ {
-			if crc&0x0001 != 0 {
-				crc = (crc >> 1) ^ 0xA001
-			} else {
-				crc >>= 1
-			}
-		}
-	}
-	return crc
 }
 
 func parseHexString(s string) ([]byte, error) {
@@ -708,15 +634,6 @@ func sendAndReceive(addr string, payload []byte) ([]byte, error) {
 
 // ==================== UHF RFID CPH 协议支持 ====================
 
-// rfChecksum 按UHF RFID协议文档的算法计算校验和：从 header 到 checksum 前一字节的累加和，取反加一。
-func rfChecksum(data []byte) byte {
-	var sum byte
-	for _, b := range data {
-		sum += b
-	}
-	return ^sum + 1
-}
-
 // buildRFWorkModeFrame 构建设置RFID读写器工作模式的CPH协议帧。
 // frameType: 0x00=命令帧, address: 读写器地址, workMode: 0=主动 1=被动 2=触发
 func buildRFWorkModeFrame(address uint16, workMode byte) []byte {
@@ -759,7 +676,7 @@ func buildRFWorkModeFrame(address uint16, workMode byte) []byte {
 	tmpFrame = append(tmpFrame, params...)
 
 	frame = append(frame, params...)
-	frame = append(frame, rfChecksum(tmpFrame))
+	frame = append(frame, rs485.CardRfChecksum(tmpFrame))
 	return frame
 }
 

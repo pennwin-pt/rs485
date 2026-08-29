@@ -83,16 +83,16 @@ func BuildChannelPayload(deviceAddr byte, channel byte, on bool) []byte {
 	}
 	data := []byte{deviceAddr, 0x05, 0x00, 0x01, channel, stateByte}
 
-	crc := crc16Modbus(data)
+	crc := Crc16Modbus(data)
 	payload := make([]byte, 0, len(data)+2)
 	payload = append(payload, data...)
 	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
 	return payload
 }
 
-// crc16Modbus 计算 Modbus RTU 常用的 CRC-16（多项式 0x8005，低字节在前）。
-// 与 rs485_client.go 中的 crc16Modbus 完全一致。
-func crc16Modbus(data []byte) uint16 {
+// Crc16Modbus 计算 Modbus RTU 常用的 CRC-16（多项式 0x8005，低字节在前）。
+// 与 rs485_client.go 中的 Crc16Modbus 完全一致。
+func Crc16Modbus(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
 	for _, b := range data {
 		crc ^= uint16(b)
@@ -183,7 +183,7 @@ func relayBitForChannel(channel byte) RelayBit {
 // 状态字节的位含义见 RelayBit 的注释。
 func QueryRelayStatus(addr string, deviceAddr byte) (byte, error) {
 	data := []byte{deviceAddr, 0x02, 0x00, 0x01, 0x00, 0x03}
-	crc := crc16Modbus(data)
+	crc := Crc16Modbus(data)
 	payload := make([]byte, 0, len(data)+2)
 	payload = append(payload, data...)
 	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
@@ -328,7 +328,7 @@ func SendClose(addr string, deviceAddr byte, channel byte) error {
 func QueryDeviceTrigger(addr string, deviceAddr byte, readTimeout time.Duration) ([]byte, error) {
 	// 组装查询指令
 	data := []byte{deviceAddr, 0x02, 0x00, 0x02, 0x00, 0x05}
-	crc := crc16Modbus(data)
+	crc := Crc16Modbus(data)
 	payload := make([]byte, 0, len(data)+2)
 	payload = append(payload, data...)
 	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
@@ -409,7 +409,7 @@ func readCardRFFrame(reader *bufio.Reader) (*cardRfFrame, []byte, error) {
 	}
 
 	full := append(append(header, rest...), params...)
-	if want := cardRfChecksum(full); want != checksumByte[0] {
+	if want := CardRfChecksum(full); want != checksumByte[0] {
 		return nil, raw, fmt.Errorf("校验和不匹配：期望 %02X 实际 %02X", want, checksumByte[0])
 	}
 
@@ -421,8 +421,8 @@ func readCardRFFrame(reader *bufio.Reader) (*cardRfFrame, []byte, error) {
 	}, raw, nil
 }
 
-// cardRfChecksum 按UHF RFID协议文档的算法计算校验和：从 header 到 checksum 前一字节的累加和，取反加一。
-func cardRfChecksum(data []byte) byte {
+// CardRfChecksum 按UHF RFID协议文档的算法计算校验和：从 header 到 checksum 前一字节的累加和，取反加一。
+func CardRfChecksum(data []byte) byte {
 	var sum byte
 	for _, b := range data {
 		sum += b
@@ -484,7 +484,7 @@ func buildCardRFFrame(frameType byte, address uint16, frameCode byte, params []b
 	frame = append(frame, 'R', 'F', frameType, byte(address>>8), byte(address&0xFF), frameCode)
 	frame = append(frame, byte(len(params)>>8), byte(len(params)&0xFF))
 	frame = append(frame, params...)
-	frame = append(frame, cardRfChecksum(frame))
+	frame = append(frame, CardRfChecksum(frame))
 	return frame
 }
 

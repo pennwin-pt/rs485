@@ -266,7 +266,7 @@ func buildPollCommand(deviceAddr byte) []byte {
 	body = append(body, deviceAddr)
 	body = append(body, pollCommandBody...)
 
-	crc := crc16Modbus(body)
+	crc := rs485.Crc16Modbus(body)
 	payload := make([]byte, 0, len(body)+2)
 	payload = append(payload, body...)
 	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
@@ -378,7 +378,7 @@ func buildRFFrame(frameType byte, address uint16, frameCode byte, params []byte)
 	frame = append(frame, 'R', 'F', frameType, byte(address>>8), byte(address&0xFF), frameCode)
 	frame = append(frame, byte(len(params)>>8), byte(len(params)&0xFF))
 	frame = append(frame, params...)
-	frame = append(frame, rfChecksum(frame))
+	frame = append(frame, rs485.CardRfChecksum(frame))
 	return frame
 }
 
@@ -431,7 +431,7 @@ func readRFFrame(reader *bufio.Reader) (*rfFrame, []byte, error) {
 	}
 
 	full := append(append(header, rest...), params...)
-	if want := rfChecksum(full); want != checksumByte[0] {
+	if want := rs485.CardRfChecksum(full); want != checksumByte[0] {
 		return nil, raw, fmt.Errorf("校验和不匹配：期望 %02X 实际 %02X", want, checksumByte[0])
 	}
 
