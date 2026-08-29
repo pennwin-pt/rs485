@@ -1,0 +1,924 @@
+// rs485-debugger — 交互式 RS485/TCP 指令发送工具
+//
+// 用法:
+//
+//	go build -o rs485-debugger.exe ./cmd
+//	rs485-debugger.exe 192.168.1.100
+//	rs485-debugger.exe 192.168.1.100:8899 10
+//
+// 启动后进入循环：每一轮先选择本轮要用的模式：
+//
+//	· 直接回车（或输入 1）  → 组合指令模式：依次输入开启/关闭两组指令，
+//	  自动执行 发送开启 → 倒计时等待 → 发送关闭 的完整流程。
+//	· 输入 2 或 s           → 单个指令模式：输入一条指令并立即发送一次。
+//	· 输入 up                → 01 路 开→关：输入后再输入十六进制设备地址（如 00、01、05 均可），
+//	  对该地址执行 开(XX 05 00 01 01 FF) → 关(XX 05 00 01 01 00)。
+//	· 输入 down              → 02 路 开→关：输入后再输入十六进制设备地址（如 00、01、05 均可），
+//	  对该地址执行 开(XX 05 00 01 02 FF) → 关(XX 05 00 01 02 00)。
+//	· 输入 check             → 查询状态：输入后再输入十六进制设备地址（如 00、01、05 均可），
+//	  对该地址发送查询状态指令 XX 02 00 02 00 05，立即发送一次。
+//	· 输入 card              → 读卡模式：和 mode 用法一致，先输入 card 进入该模式，
+//	  再输入十六进制设备地址（如 00、01、05），随后连续读卡 2 秒（每 50ms 查询一次），
+//	  结束后打印命中/未命中次数汇总和读到的卡号列表。
+//	· 输入 card1             → 只读一次模式：用法与 card 一致，输入十六进制设备地址后
+//	  只发送一次查询指令、只读一次响应，立即打印结果，不做 2 秒轮询。
+//	· 输入 mode / workmode  → 【新功能】设置 RFID 读写器工作模式：支持自定义设备地址，选择主动/被动/触发模式。
+//	· 输入 verify / vf      → 【新功能】带确认重试的开→保持→关：输入十六进制设备地址后，
+//	  每一步（开/关）发送指令后都会查询继电器实际状态确认是否生效，不符合预期会自动重发，
+//	  最多重试 5 次，逻辑对应另一个工程 rs485.go 里的 sendChannelWithVerify。
+//	· 输入 q / quit / exit  → 退出程序。
+//
+// 每一轮流程结束后会自动回到模式选择，可重复执行任意次。
+package main
+
+import (
+	"bufio"
+	"encoding/hex"
+	"fmt"
+	"github.com/pennwin-pt/rs485"
+	"io"
+	"net"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	defaultPort           = "8001"
+	defaultCardReaderPort = "8003"
+	defaultHost           = "192.168.2.170"
+	defaultTarget         = defaultHost + ":" + defaultPort
+	defaultDelaySeconds   = 12 // 未指定关闭延时时使用的默认秒数
+	warnAheadSeconds      = 1  // 发送关闭指令前多少秒开始提示“即将发送”
+	readTimeout           = 1 * time.Second
+	connectTimeout        = 5 * time.Second
+	payloadLen            = 6 // 用户输入固定 6 字节，CRC-16 占 2 字节，共发送 8 字节
+)
+
+type runMode int
+
+const (
+	modeCombo       runMode = iota // 组合指令模式：开启 → 等待 → 关闭
+	modeSingle                     // 单个指令模式：发送一条指令
+	modeQuit                       // 退出程序
+	modeUp                         // 01 路开→关：交互式输入十六进制设备地址，可对任意地址下发
+	modeDown                       // 02 路开→关：交互式输入十六进制设备地址，可对任意地址下发
+	modeCheck                      // 查询状态：交互式输入十六进制设备地址，查询任意地址
+	modeCard                       // 读卡模式：交互式输入十六进制设备地址，连续读卡 2 秒并汇总命中次数
+	modeCard1                      // 只读一次模式：交互式输入十六进制设备地址，只发送并读取一次
+	modeSetWorkMode                // 设置RFID读写器工作模式（主动/被动/触发）
+	modeVerify                     // 带确认重试的开→保持→关：交互式输入十六进制设备地址
+)
+
+var hexCleanRE = regexp.MustCompile(`[\s,:-]+`)
+
+func main() {
+	var target string
+	if len(os.Args) < 2 {
+		target = defaultTarget
+		fmt.Printf("未指定目标地址，使用默认值：%s\n", target)
+	} else {
+		target = os.Args[1]
+	}
+
+	delaySeconds := defaultDelaySeconds
+	if len(os.Args) >= 3 {
+		if v, err := strconv.Atoi(strings.TrimSpace(os.Args[2])); err == nil && v > 0 {
+			delaySeconds = v
+		} else {
+			fmt.Printf("关闭延时参数无效，使用默认值：%d 秒\n", defaultDelaySeconds)
+		}
+	} else {
+		fmt.Printf("未指定关闭延时，使用默认值：%d 秒\n", defaultDelaySeconds)
+	}
+
+	host, port := parseTarget(target)
+	addr := net.JoinHostPort(host, port)
+
+	printBanner(addr, delaySeconds)
+
+	//StartTrapDetectionSystem(addr)
+
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		mode := promptForMode(scanner)
+
+		switch mode {
+		case modeQuit:
+			fmt.Println("已退出。")
+			return
+
+		case modeCombo:
+			fmt.Println("\n【组合指令模式】请依次输入两组指令：")
+			openPayload := promptForCommand(scanner, "第 1 组【开启】")
+			closePayload := promptForCommand(scanner, "第 2 组【关闭】")
+			runOpenCloseSequence(addr, openPayload, closePayload, delaySeconds)
+
+		case modeSingle:
+			fmt.Println("\n【单个指令模式】请输入要发送的一条指令：")
+			payload := promptForCommand(scanner, "单条")
+			sendAndPrint(addr, "指令", payload)
+
+		case modeUp:
+			runUpMode(addr, scanner, delaySeconds)
+
+		case modeDown:
+			runDownMode(addr, scanner, delaySeconds)
+
+		case modeCheck:
+			runCheckMode(addr, scanner)
+
+		case modeCard:
+			runCardMode(scanner)
+
+		case modeCard1:
+			runCardMode1(scanner)
+
+		case modeSetWorkMode:
+			runSetWorkMode(addr, scanner)
+
+		case modeVerify:
+			runVerifiedChannel(addr, scanner, delaySeconds)
+		}
+	}
+}
+
+// runPresetUpDown 根据预设名（"up05"/"down01" 等）和设备地址码执行对应的开→关组合指令。
+// 预设名以 "up" 开头时用 01 路（05 00 01 01），以 "down" 开头时用 02 路（05 00 01 02）。
+func runPresetUpDown(addr, presetName string, deviceAddr byte, delaySeconds int) {
+	var channel byte
+	if strings.HasPrefix(presetName, "up") {
+		channel = 0x01
+	} else {
+		channel = 0x02
+	}
+
+	fmt.Printf("\n【预设组合：%s】设备地址 0x%02X，%02X 路 开→关：\n", presetName, deviceAddr, channel)
+	openPayload := mustBuildPayload(fmt.Sprintf("%02X 05 00 01 %02X FF", deviceAddr, channel))
+	closePayload := mustBuildPayload(fmt.Sprintf("%02X 05 00 01 %02X 00", deviceAddr, channel))
+	runOpenCloseSequence(addr, openPayload, closePayload, delaySeconds)
+}
+
+// runUpMode 是 up05/up01 合并后的通用"01 路 开→关"模式：
+// 用法与 down/check/card 一致——先输入 up 进入本模式，再输入十六进制设备地址，
+// 回车后对该地址执行 01 路 开(XX 05 00 01 01 FF) → 等待 → 关(XX 05 00 01 01 00)。
+func runUpMode(addr string, scanner *bufio.Scanner, delaySeconds int) {
+	fmt.Println("\n【up 模式】请输入十六进制设备地址（如 00、01、05），随后将对该地址执行 01 路 开→保持→关。")
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+	runPresetUpDown(addr, fmt.Sprintf("up%02X", deviceAddr), byte(deviceAddr), delaySeconds)
+}
+
+// runDownMode 是 down05/down01 合并后的通用"02 路 开→关"模式：
+// 用法与 mode/card/check 一致——先输入 down 进入本模式，再输入十六进制设备地址，
+// 回车后对该地址执行 02 路 开(XX 05 00 01 02 FF) → 等待 → 关(XX 05 00 01 02 00)。
+func runDownMode(addr string, scanner *bufio.Scanner, delaySeconds int) {
+	fmt.Println("\n【down 模式】请输入十六进制设备地址（如 00、01、05），随后将对该地址执行 02 路 开→保持→关。")
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+	runPresetUpDown(addr, fmt.Sprintf("down%02X", deviceAddr), byte(deviceAddr), delaySeconds)
+}
+
+// runPresetCheck 根据设备地址码执行查询状态指令。
+func runPresetCheck(addr string, deviceAddr byte) {
+	fmt.Printf("\n【查询状态】设备地址 0x%02X：\n", deviceAddr)
+	payload := mustBuildPayload(fmt.Sprintf("%02X 02 00 02 00 05", deviceAddr))
+	sendAndPrint(addr, "指令", payload)
+}
+
+// runCheckMode 是 check05/check01 合并后的通用查询模式：
+// 用法与 mode/card 一致——先输入 check 进入本模式，再输入十六进制设备地址，
+// 回车后对该地址发送一次查询状态指令（02 00 02 00 05）并打印回包。
+func runCheckMode(addr string, scanner *bufio.Scanner) {
+	fmt.Println("\n【查询状态模式】请输入十六进制设备地址（如 00、01、05），随后将对该地址发送一次查询状态指令。")
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+	runPresetCheck(addr, byte(deviceAddr))
+}
+
+// ==================== 带确认重试的开/关（对应另一工程 rs485.go 里的 sendChannelWithVerify） ====================
+//
+// 🎯 之前 up05/down05 这类预设指令都是"发了就算"，不管继电器有没有真的动作。
+// 这里补一套"发送 → 隔一小段时间 → 查询继电器实际状态确认 → 不符合预期就重发"的逻辑，
+// 完全照搬另一个工程（trap-system-server）里 internal/rs485/rs485.go 的
+// sendChannelWithVerify + QueryRelayStatus 的做法，只是把网络收发换成本文件已有的 sendAndReceive。
+
+const (
+	// verifyQueryDelay 发送开/关指令后，等待多久再查询一次硬件状态确认是否生效。
+	verifyQueryDelay = 200 * time.Millisecond
+	// maxVerifyAttempts "发送→查询确认"这一组动作最多尝试的次数（含第一次）。
+	maxVerifyAttempts = 5
+)
+
+// relayBitForChannel 把 channel（0x01=up、0x02=down，即本文件 up05/down05 用的约定）
+// 映射到查询回包状态字节里对应要核对的继电器位：01 路(up)对应 M1(0x01)，02 路(down)对应 M2(0x02)。
+func relayBitForChannel(channel byte) byte {
+	if channel == 0x01 {
+		return 0x01 // M1
+	}
+	return 0x02 // M2
+}
+
+// queryRelayStatus 发送查询继电器状态指令（XX 02 00 01 00 03 + CRC16），
+// 返回回包状态字节（回包 6 字节数据 + 2 字节 CRC，状态值在 resp[5]）。
+// 注意：这条指令和 check05/check01 用的查询触发状态指令（XX 02 00 02 00 05）不是同一条，
+// 这里查的是继电器开关状态，与 rs485.go 里的 QueryRelayStatus 保持一致。
+func queryRelayStatus(addr string, deviceAddr byte) (byte, error) {
+	payload := mustBuildPayload(fmt.Sprintf("%02X 02 00 01 00 03", deviceAddr))
+	fmt.Printf("  → [查询] 目标 %s，发送：%s\n", addr, rs485.FormatHex(payload))
+
+	resp, err := sendAndReceive(addr, payload)
+	if err != nil {
+		return 0, fmt.Errorf("发送查询指令失败: %w", err)
+	}
+	if len(resp) < 6 {
+		return 0, fmt.Errorf("回包长度不足，收到 %d 字节：%s", len(resp), rs485.FormatHex(resp))
+	}
+	return resp[5], nil
+}
+
+// sendCommandOnly 只把指令发出去，不等待、不读取设备回包——用于开/关这类指令，
+// 硬件收到后不会有任何数据返回，如果还像 sendAndReceive 那样等 readTimeout 去读，
+// 纯粹是白白等待，没有意义。发送成功即返回 nil，只有连接/写入失败才算错误。
+// 对应另一工程 rs485.go 里的 SendFrame。
+func sendCommandOnly(addr string, payload []byte) error {
+	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
+	if err != nil {
+		return fmt.Errorf("连接 %s 失败: %w", addr, err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(readTimeout)); err != nil {
+		return err
+	}
+	if _, err := conn.Write(payload); err != nil {
+		return fmt.Errorf("发送失败: %w", err)
+	}
+	return nil
+}
+
+// sendChannelWithVerify 发送一次开/关指令后，隔 verifyQueryDelay 用 queryRelayStatus
+// 查一次硬件实际状态，确认是否变成了期望的 on/off；不符合预期就重新发送+重新查询，
+// 最多尝试 maxVerifyAttempts 次。逻辑与另一工程 rs485.go 里的同名函数完全对应。
+//
+// 🌟 开/关指令本身发出去后设备不会回包，所以这里用 sendCommandOnly（发送即返回，不等读），
+// 而不是 sendAndReceive；真正需要读回包确认结果的，是发送完之后另外调用的 queryRelayStatus。
+func sendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool) error {
+	bit := relayBitForChannel(channel)
+	stateByte := "00"
+	if on {
+		stateByte = "FF"
+	}
+	payload := mustBuildPayload(fmt.Sprintf("%02X 05 00 01 %02X %s", deviceAddr, channel, stateByte))
+
+	action := "关闭"
+	if on {
+		action = "开启"
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxVerifyAttempts; attempt++ {
+		fmt.Printf("  → [%s] 目标 %s，第 %d/%d 次发送：%s（该指令设备不会回包，发送成功即视为已送达）\n", action, addr, attempt, maxVerifyAttempts, rs485.FormatHex(payload))
+		if err := rs485.SendFrame(addr, payload); err != nil {
+			lastErr = fmt.Errorf("第 %d/%d 次发送指令失败: %w", attempt, maxVerifyAttempts, err)
+			fmt.Printf("  ✗ [%s] 第 %d/%d 次发送失败：%v\n", action, attempt, maxVerifyAttempts, err)
+			continue
+		}
+
+		time.Sleep(verifyQueryDelay)
+
+		status, err := queryRelayStatus(addr, deviceAddr)
+		if err != nil {
+			lastErr = fmt.Errorf("第 %d/%d 次发送后查询硬件状态失败: %w", attempt, maxVerifyAttempts, err)
+			fmt.Printf("  ✗ [%s] 第 %d/%d 次查询状态失败：%v\n", action, attempt, maxVerifyAttempts, err)
+			continue
+		}
+
+		actualOn := status&bit != 0
+		fmt.Printf("  ← [%s] 第 %d/%d 次查询回包状态字节=0x%02X，期望开=%v，实际开=%v\n", action, attempt, maxVerifyAttempts, status, on, actualOn)
+
+		if actualOn == on {
+			fmt.Printf("  ✓ [%s] 第 %d 次尝试确认生效\n", action, attempt)
+			return nil
+		}
+		lastErr = fmt.Errorf("第 %d/%d 次发送后硬件状态未按预期变化（期望开=%v，实际状态字节=0x%02X）", attempt, maxVerifyAttempts, on, status)
+		if attempt < maxVerifyAttempts {
+			fmt.Printf("  ⚠ [%s] 状态未变化，准备第 %d 次重试\n", action, attempt+1)
+		}
+	}
+
+	return fmt.Errorf("%s指令重试 %d 次后仍未确认生效: %w", action, maxVerifyAttempts, lastErr)
+}
+
+// runVerifiedChannel 是新增的"verify"菜单：只需要输入设备地址，
+// 随后自动执行"开→保持 delaySeconds 秒→关"整个流程，
+// 开、关两步都走 sendChannelWithVerify（发送后查询确认+失败重试最多5次），
+// 通道固定用 0x01（对应本文件 up05/down05 里"up"的 01 路）。
+func runVerifiedChannel(addr string, scanner *bufio.Scanner, delaySeconds int) {
+	fmt.Println("\n【带确认重试模式】请输入十六进制设备地址（如 00、01、05），随后将执行 开→保持→关，每步都会查询继电器状态确认生效。")
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+
+	const channel = 0x02 // 01 路，对应本文件 up 系列预设
+
+	fmt.Printf("\n【verify】设备地址 0x%02X，01 路：开始执行 开→保持%d秒→关（每步最多重试 %d 次确认）\n", deviceAddr, delaySeconds, maxVerifyAttempts)
+
+	if err := sendChannelWithVerify(addr, byte(deviceAddr), channel, true); err != nil {
+		fmt.Printf("✗ 开启失败：%v\n", err)
+		return
+	}
+	fmt.Println("✓ 开启已确认生效。")
+
+	for elapsed := 1; elapsed <= delaySeconds; elapsed++ {
+		time.Sleep(1 * time.Second)
+		fmt.Printf("  ⏱ 倒计时：还剩 %d 秒\n", delaySeconds-elapsed)
+	}
+
+	if err := sendChannelWithVerify(addr, byte(deviceAddr), channel, false); err != nil {
+		fmt.Printf("✗ 关闭失败：%v\n", err)
+		return
+	}
+	fmt.Println("✓ 关闭已确认生效。流程执行完毕。")
+}
+
+// runPresetCard 根据设备地址码从 motorReaderMap 找到对应读卡器，
+// 连续读卡 cardModeDuration（默认 2 秒），期间每隔 cardModePollInterval（默认 50ms）查询一次，
+// 结束后打印命中/未命中次数汇总和读到的卡号列表。
+func runPresetCard(presetName string, deviceAddr byte) {
+	fmt.Printf("\n【预设：%s】连续查询地址码 0x%02X 对应读卡器的卡号列表：\n", presetName, deviceAddr)
+	reader, ok := motorReaderMap[deviceAddr]
+	if !ok {
+		fmt.Printf("  ✗ motorReaderMap 里没有配置地址码 0x%02X 对应的读卡器信息。使用默认值 %s\n", deviceAddr, defaultTarget)
+		if _, err := QueryCardsRepeated(reader, true, deviceAddr, cardModeDuration, cardModePollInterval); err != nil {
+			fmt.Printf("  ✗ 查询失败：%v\n", err)
+		}
+		return
+	}
+	if _, err := QueryCardsRepeated(reader, false, deviceAddr, cardModeDuration, cardModePollInterval); err != nil {
+		fmt.Printf("  ✗ 查询失败：%v\n", err)
+	}
+}
+
+// runCardMode 是 card00/card01/card05 三个预设合并后的统一读卡模式：
+// 用法与 mode 一致——先输入 card 进入本模式，再输入十六进制设备地址，
+// 回车后连续读卡 cardModeDuration（2 秒），期间每隔 cardModePollInterval（50ms）查询一次，
+// 结束后打印命中/未命中次数汇总。
+func runCardMode(scanner *bufio.Scanner) {
+	fmt.Printf("\n【读卡模式】请输入十六进制设备地址（如 00、01、05），随后将连续读卡 %v（每 %v 查询一次）。", cardModeDuration, cardModePollInterval)
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+	runPresetCard(fmt.Sprintf("card%02X", deviceAddr), byte(deviceAddr))
+}
+
+// runPresetCard1 根据设备地址码从 motorReaderMap 找到对应读卡器，只发送并读取一次
+// （不做 2 秒轮询），结束后打印本次是否命中以及读到的卡号。
+func runPresetCard1(presetName string, deviceAddr byte) {
+	fmt.Printf("\n【预设：%s】只读一次地址码 0x%02X 对应读卡器的卡号：\n", presetName, deviceAddr)
+	reader, ok := motorReaderMap[deviceAddr]
+	if !ok {
+		fmt.Printf("  ✗ motorReaderMap 里没有配置地址码 0x%02X 对应的读卡器信息。使用默认值 %s\n", deviceAddr, defaultTarget)
+		if _, err := QueryCardsOnce(reader, true, uint16(deviceAddr)); err != nil {
+			fmt.Printf("  ✗ 查询失败：%v\n", err)
+		}
+		return
+	}
+	if _, err := QueryCardsOnce(reader, false, uint16(deviceAddr)); err != nil {
+		fmt.Printf("  ✗ 查询失败：%v\n", err)
+	}
+}
+
+// runCardMode1 是"只读一次"模式：用法与 runCardMode 一致——先输入 card1 进入本模式，
+// 再输入十六进制设备地址，回车后只发送并读取一次查询指令（不做 2 秒轮询），
+// 结束后打印本次是否命中以及读到的卡号。
+func runCardMode1(scanner *bufio.Scanner) {
+	fmt.Println("\n【只读一次模式】请输入十六进制设备地址（如 00、01、05），随后只发送并读取一次查询指令。")
+	deviceAddr := promptForCardAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+	runPresetCard1(fmt.Sprintf("card1_%02X", deviceAddr), byte(deviceAddr))
+}
+
+// promptForCardAddress 提示用户输入十六进制设备地址（0x00~0xFF，对应 motorReaderMap 的 key）。
+func promptForCardAddress(scanner *bufio.Scanner) int {
+	for {
+		fmt.Print("请输入设备地址（十六进制，如 00、01、05，或 -1 取消）> ")
+		if !scanner.Scan() {
+			fmt.Println("\n输入中断，程序退出。")
+			os.Exit(0)
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		if input == "-1" || input == "cancel" {
+			return -1
+		}
+
+		addr, err := strconv.ParseInt(input, 16, 16)
+		if err != nil {
+			fmt.Printf("✗ 输入格式有误：%v，请输入两位十六进制数字（如 05）\n", err)
+			continue
+		}
+
+		if addr < 0 || addr > 0xFF {
+			fmt.Println("✗ 地址范围应为 0x00 ~ 0xFF")
+			continue
+		}
+
+		fmt.Printf("✓ 已选择设备地址：0x%02X\n", addr)
+		return int(addr)
+	}
+}
+
+// promptForMode 询问用户本轮要使用的模式。直接回车默认选择组合指令模式。
+func promptForMode(scanner *bufio.Scanner) runMode {
+	fmt.Println("\n----------------------------------------")
+	fmt.Println("请选择本轮运行模式：")
+	fmt.Println("  直接回车 或 1  → 组合指令模式（开启/关闭两组指令，自动 开→等待→关）")
+	fmt.Println("  2 或 s         → 单个指令模式（输入一条指令，立即发送一次）")
+	fmt.Println("  up             → 01 路 开→关：输入后再输入十六进制设备地址（如 00/01/05），对该地址执行 开(XX 05 00 01 01 FF) → 关(XX 05 00 01 01 00)")
+	fmt.Println("  down           → 02 路 开→关：输入后再输入十六进制设备地址（如 00/01/05），对该地址执行 开(XX 05 00 01 02 FF) → 关(XX 05 00 01 02 00)")
+	fmt.Println("  check          → 查询状态：输入后再输入十六进制设备地址（如 00/01/05），对该地址发送查询状态指令 XX 02 00 02 00 05")
+	fmt.Println("  card           → 读卡模式：输入后再输入十六进制设备地址（如 00/01/05），连续读卡2秒并汇总命中次数")
+	fmt.Println("  card1          → 只读一次模式：用法同 card，只发送并读取一次查询指令，不做2秒轮询")
+	fmt.Println("  mode           → 设置RFID读写器工作模式（主动/被动/触发）- 支持自定义设备地址")
+	fmt.Println("  verify         → 带确认重试的开→保持→关：输入后再输入十六进制设备地址，每步发送后查询继电器状态确认，不符合预期自动重发（最多5次）")
+	fmt.Println("  q / quit / exit → 退出程序")
+	fmt.Print("请选择 > ")
+
+	if !scanner.Scan() {
+		fmt.Println("\n输入中断，程序退出。")
+		os.Exit(0)
+	}
+
+	choice := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	switch choice {
+	case "", "1":
+		return modeCombo
+	case "2", "s", "single":
+		return modeSingle
+	case "up":
+		return modeUp
+	case "down":
+		return modeDown
+	case "check":
+		return modeCheck
+	case "card":
+		return modeCard
+	case "card1":
+		return modeCard1
+	case "mode", "workmode", "setmode":
+		return modeSetWorkMode
+	case "verify", "vf":
+		return modeVerify
+	case "q", "quit", "exit":
+		return modeQuit
+	default:
+		fmt.Println("  提示：无法识别的选项，已按默认的组合指令模式处理。")
+		return modeCombo
+	}
+}
+
+// mustBuildPayload 用于程序内置的预设指令字符串（up/down/check 等），
+// 这些字符串是写死的常量，格式必定合法，如果出错说明是代码本身写错了，直接 panic 更容易发现问题。
+func mustBuildPayload(s string) []byte {
+	payload, err := buildPayloadWithCRC(s)
+	if err != nil {
+		panic(fmt.Sprintf("内置预设指令 %q 格式有误，请检查代码：%v", s, err))
+	}
+	return payload
+}
+
+// promptForCommand 反复提示用户输入一条十六进制指令，直到格式合法为止，返回已附加 CRC 的完整报文。
+func promptForCommand(scanner *bufio.Scanner, label string) []byte {
+	for {
+		fmt.Printf("%s指令（十六进制）> ", label)
+		if !scanner.Scan() {
+			fmt.Println("\n输入中断，程序退出。")
+			os.Exit(0)
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			fmt.Println("  提示：输入不能为空，请重新输入。")
+			continue
+		}
+
+		payload, err := buildPayloadWithCRC(line)
+		if err != nil {
+			fmt.Printf("  ✗ 指令格式有误：%v\n", err)
+			fmt.Println("  示例：05 05 00 01 01 FF  或  0505000101FF（固定 6 字节，CRC 自动追加）")
+			continue
+		}
+		return payload
+	}
+}
+
+// sendAndPrint 发送一条已带 CRC 的报文并打印发送内容与回包结果。
+func sendAndPrint(addr, label string, payload []byte) {
+	fmt.Printf("  → 目标 %s，发送%s %d 字节：%s\n", addr, label, len(payload), rs485.FormatHex(payload))
+
+	resp, err := sendAndReceive(addr, payload)
+	if err != nil {
+		fmt.Printf("  ✗ 通信失败：%v\n", err)
+		return
+	}
+	if len(resp) == 0 {
+		fmt.Println("  ← 收到回包：（无数据，设备在超时时间内未响应）")
+	} else {
+		fmt.Printf("  ← 收到回包：%s\n", rs485.FormatHex(resp))
+	}
+}
+
+// runOpenCloseSequence 发送开启指令，按秒倒计时等待，再发送关闭指令。
+func runOpenCloseSequence(addr string, openPayload, closePayload []byte, delaySeconds int) {
+	fmt.Printf("\n两组指令已录入完成，开始执行流程（%d 秒后自动发送关闭指令）...\n", delaySeconds)
+
+	sendAndPrint(addr, "开启指令", openPayload)
+
+	warnAt := warnAheadSeconds
+	if warnAt >= delaySeconds {
+		warnAt = delaySeconds - 1 // 避免延时过短时提示与发送同时刷屏
+	}
+
+	for elapsed := 1; elapsed <= delaySeconds; elapsed++ {
+		time.Sleep(1 * time.Second)
+		remaining := delaySeconds - elapsed
+		fmt.Printf("  ⏱ 倒计时：还剩 %d 秒\n", remaining)
+		if remaining > 0 && remaining <= warnAt {
+			fmt.Println("  ⚠ 即将发送关闭指令")
+		}
+	}
+
+	sendAndPrint(addr, "关闭指令", closePayload)
+	fmt.Println("流程执行完毕。")
+}
+
+func printUsage() {
+	fmt.Println("RS485 TCP 指令发送工具")
+	fmt.Println()
+	fmt.Println("用法:")
+	fmt.Println("  rs485-debugger [设备IP[:端口]] [关闭延时秒数]")
+	fmt.Println()
+	fmt.Printf("默认目标地址：%s\n", defaultTarget)
+	fmt.Printf("默认关闭延时：%d 秒\n", defaultDelaySeconds)
+	fmt.Println()
+	fmt.Println("示例:")
+	fmt.Println("  rs485-debugger")
+	fmt.Println("  rs485-debugger 192.168.1.100")
+	fmt.Println("  rs485-debugger 192.168.2.170:8001 10")
+	fmt.Println()
+	fmt.Println("程序启动后，每一轮都会让你在下面这些模式里选一个：")
+	fmt.Println("  回车/1、2/s、up、down、check、card、card1、mode、verify、q/quit/exit（详见模式选择菜单）")
+}
+
+func printBanner(addr string, delaySeconds int) {
+	fmt.Println("========================================")
+	fmt.Println("  RS485 TCP 指令发送工具 + RFID读写器工作模式设置")
+	fmt.Println("========================================")
+	fmt.Printf("目标设备：%s\n", addr)
+	fmt.Printf("关闭延时：%d 秒\n", delaySeconds)
+	fmt.Println()
+	fmt.Println("使用说明：")
+	fmt.Println("  · 每一轮都会先让你选择模式（直接回车 = 组合指令模式）")
+	fmt.Println("  · 组合指令模式：输入【开启】【关闭】两组指令（各 6 字节十六进制）")
+	fmt.Println("    自动执行：发送开启 → 倒计时等待 → 发送关闭")
+	fmt.Println("  · 单个指令模式：输入一条指令，立即发送一次")
+	fmt.Println("  · up：01 路 开→关，输入后再输入十六进制设备地址（任意地址均可）")
+	fmt.Println("  · down：02 路 开→关，输入后再输入十六进制设备地址（任意地址均可）")
+	fmt.Println("  · check：查询状态，输入后再输入十六进制设备地址（任意地址均可），发送查询状态指令 XX 02 00 02 00 05")
+	fmt.Println("  · card：读卡模式，输入后再输入十六进制设备地址（如 00/01/05），连续读卡2秒（每50ms查询一次）并汇总命中/未命中次数")
+	fmt.Println("  · card1：只读一次模式，用法同 card，只发送并读取一次查询指令，不做2秒轮询")
+	fmt.Println("  · verify：带确认重试的 开→保持→关，输入设备地址后每步发送指令都会查询继电器状态确认生效，不符合预期自动重发（最多5次）")
+	fmt.Println("  · 【新】mode/workmode：设置RFID读写器工作模式，支持自定义设备地址")
+	fmt.Println("    └─ 主动模式（0）：上电后自动盘寻，接收指令可继续或停止")
+	fmt.Println("    └─ 被动模式（1）：上电后不盘寻，接收指令后盘寻一次并停止")
+	fmt.Println("    └─ 触发模式（2）：只有触发线有信号时才读卡")
+	fmt.Println("  · 程序会自动计算 CRC-16 并追加到末尾（共发送 8 字节）")
+	fmt.Println("  · 支持带空格：05 05 00 01 01 FF")
+	fmt.Println("  · 也支持无空格：0505000101FF")
+	fmt.Println("  · 在模式选择处输入 quit / exit / q 可退出程序")
+	fmt.Println("========================================")
+}
+
+func parseTarget(arg string) (host, port string) {
+	if h, p, err := net.SplitHostPort(arg); err == nil {
+		return h, p
+	}
+	return arg, defaultPort
+}
+
+func buildPayloadWithCRC(s string) ([]byte, error) {
+	data, err := parseHexString(s)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != payloadLen {
+		return nil, fmt.Errorf("必须为 %d 个字节（%d 个十六进制字符），当前 %d 个字节", payloadLen, payloadLen*2, len(data))
+	}
+
+	crc := crc16Modbus(data)
+	payload := make([]byte, 0, payloadLen+2)
+	payload = append(payload, data...)
+	payload = append(payload, byte(crc&0xFF), byte(crc>>8))
+	return payload, nil
+}
+
+// crc16Modbus 计算 Modbus RTU 常用的 CRC-16（多项式 0x8005，低字节在前）。
+func crc16Modbus(data []byte) uint16 {
+	var crc uint16 = 0xFFFF
+	for _, b := range data {
+		crc ^= uint16(b)
+		for i := 0; i < 8; i++ {
+			if crc&0x0001 != 0 {
+				crc = (crc >> 1) ^ 0xA001
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc
+}
+
+func parseHexString(s string) ([]byte, error) {
+	cleaned := hexCleanRE.ReplaceAllString(strings.TrimSpace(s), "")
+	if cleaned == "" {
+		return nil, fmt.Errorf("输入为空")
+	}
+	if len(cleaned)%2 != 0 {
+		return nil, fmt.Errorf("十六进制字符数必须为偶数（当前 %d 个）", len(cleaned))
+	}
+	for _, c := range cleaned {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return nil, fmt.Errorf("包含非法字符 %q，只能使用 0-9 和 A-F", string(c))
+		}
+	}
+	return hex.DecodeString(cleaned)
+}
+
+func sendAndReceive(addr string, payload []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(readTimeout)); err != nil {
+		return nil, err
+	}
+
+	if _, err := conn.Write(payload); err != nil {
+		return nil, fmt.Errorf("发送失败: %w", err)
+	}
+
+	var buf [4096]byte
+	n, err := conn.Read(buf[:])
+	if err != nil {
+		if n > 0 {
+			fmt.Printf("  ← 出错前收到 %d 字节：%s\n", n, rs485.FormatHex(buf[:n]))
+		}
+		if err == io.EOF {
+			return nil, nil
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取回包失败: %w", err)
+	}
+	return append([]byte(nil), buf[:n]...), nil
+}
+
+// ==================== UHF RFID CPH 协议支持 ====================
+
+// rfChecksum 按UHF RFID协议文档的算法计算校验和：从 header 到 checksum 前一字节的累加和，取反加一。
+func rfChecksum(data []byte) byte {
+	var sum byte
+	for _, b := range data {
+		sum += b
+	}
+	return ^sum + 1
+}
+
+// buildRFWorkModeFrame 构建设置RFID读写器工作模式的CPH协议帧。
+// frameType: 0x00=命令帧, address: 读写器地址, workMode: 0=主动 1=被动 2=触发
+func buildRFWorkModeFrame(address uint16, workMode byte) []byte {
+	// Working Parameter TLV:
+	// TLV Type=0x23, Length=0x0F, 然后是15字节的参数
+	// 结构：Version(1) + RFPower(1) + IntervalTime(1) + WorkMode(1) + Membank(1) +
+	//      StartAddr(1) + Length(1) + FilterTime(1) + AddrMSB(1) + AddrLSB(1) +
+	//      Beep(1) + Record(1) + TriggerTime(1) + AntennaFlagMSB(1) + AntennaFlagLSB(1)
+	params := []byte{
+		0x23,     // TLV Type: Working Parameter
+		0x0F,     // TLV Length: 15 bytes
+		0x05,     // Version
+		0x14,     // RF Power (20dbm)
+		0x06,     // Inventory Interval Time (60ms = 6*10ms)
+		workMode, // Work Mode: 0=主动 1=被动 2=触发
+		0x01,     // Inventory Membank: 1=EPC
+		0x00,     // Inventory start addr
+		0x00,     // Inventory length
+		0x00,     // Filter Time: 0 seconds
+		0x00,     // Device Addr MSB
+		0x00,     // Device Addr LSB
+		0x01,     // Beep Switch: 1=开启
+		0x00,     // Record Flag
+		0x00,     // Trigger Time
+		0x00,     // Antenna Flag MSB
+		0x01,     // Antenna Flag LSB
+	}
+
+	// 构建帧：Header + FrameType + Address(2字节) + FrameCode + ParamLen(2字节) + Params + Checksum
+	frame := make([]byte, 0, 2+1+2+1+2+len(params)+1)
+	frame = append(frame, 'R', 'F')
+	frame = append(frame, 0x00)                                         // FrameType: 命令帧
+	frame = append(frame, byte(address>>8), byte(address&0xFF))         // Address
+	frame = append(frame, 0x41)                                         // FrameCode: 设置工作参数
+	frame = append(frame, byte(len(params)>>8), byte(len(params)&0xFF)) // ParamLen
+
+	// 先计算校验和的初始帧（不含checksum）
+	tmpFrame := make([]byte, len(frame))
+	copy(tmpFrame, frame)
+	tmpFrame = append(tmpFrame, params...)
+
+	frame = append(frame, params...)
+	frame = append(frame, rfChecksum(tmpFrame))
+	return frame
+}
+
+// runSetWorkMode 交互式设置RFID读写器的工作模式。
+func runSetWorkMode(addr string, scanner *bufio.Scanner) {
+	fmt.Println("\n【设置RFID读写器工作模式】")
+	fmt.Println("支持三种模式：")
+	fmt.Println("  0 = 主动模式   （上电后自动盘寻，接收指令可继续盘寻或停止）")
+	fmt.Println("  1 = 被动模式   （上电后不盘寻，接收指令后盘寻一次并停止）")
+	fmt.Println("  2 = 触发模式   （只有触发线上有触发信号时才会读卡）")
+
+	// 获取设备地址
+	deviceAddr := promptForDeviceAddress(scanner)
+	if deviceAddr < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+
+	// 选择工作模式
+	workMode := promptForWorkMode(scanner)
+	if workMode < 0 {
+		fmt.Println("✗ 已取消操作。")
+		return
+	}
+
+	// 构建CPH协议帧
+	frame := buildRFWorkModeFrame(uint16(deviceAddr), byte(workMode))
+
+	fmt.Printf("\n→ 向设备 0x%04X 发送设置命令，工作模式 %d...\n", deviceAddr, workMode)
+	fmt.Printf("  发送帧（%d 字节）：%s\n", len(frame), rs485.FormatHex(frame))
+
+	resp, err := sendAndReceive(addr, frame)
+	if err != nil {
+		fmt.Printf("✗ 通信失败：%v\n", err)
+		return
+	}
+
+	if len(resp) == 0 {
+		fmt.Println("← 收到回包：（无数据，设备在超时时间内未响应）")
+		fmt.Println("⚠ 可能原因：")
+		fmt.Println("  1. 设备地址不匹配")
+		fmt.Println("  2. 网络连接问题")
+		fmt.Println("  3. 读写器未回复或回复超时")
+		return
+	}
+
+	fmt.Printf("← 收到回包（%d 字节）：%s\n", len(resp), rs485.FormatHex(resp))
+
+	// 简单的响应校验：检查帧头和帧类型
+	if len(resp) >= 3 && resp[0] == 'R' && resp[1] == 'F' && resp[2] == 0x01 {
+		// 检查状态：如果参数包含状态码0x00则表示成功
+		if len(resp) >= 10 {
+			// 响应帧格式：RF + FrameType(1) + Address(2) + FrameCode(1) + ParamLen(2) + Status TLV + Checksum
+			// 查找 0x07 (Status TLV Type)
+			for i := 6; i < len(resp)-1; i++ {
+				if resp[i] == 0x07 && resp[i+1] == 0x01 && i+2 < len(resp) {
+					statusCode := resp[i+2]
+					if statusCode == 0x00 {
+						modeStr := ""
+						switch workMode {
+						case 0:
+							modeStr = "主动模式"
+						case 1:
+							modeStr = "被动模式"
+						case 2:
+							modeStr = "触发模式"
+						}
+						fmt.Printf("✓ 设置成功！设备 0x%04X 已设置为 %s\n", deviceAddr, modeStr)
+						return
+					} else {
+						fmt.Printf("✗ 设备返回错误状态码：0x%02X\n", statusCode)
+						printStatusCodeDescription(statusCode)
+						return
+					}
+				}
+			}
+		}
+		fmt.Println("✓ 设备已接收命令（响应帧有效）")
+		return
+	}
+
+	fmt.Println("⚠ 回包格式异常，无法确定执行结果")
+}
+
+// promptForDeviceAddress 提示用户输入十六进制设备地址。
+func promptForDeviceAddress(scanner *bufio.Scanner) int {
+	for {
+		fmt.Print("请输入设备地址（十六进制，如 00、01、05，或 -1 取消）> ")
+		if !scanner.Scan() {
+			fmt.Println("\n输入中断，程序退出。")
+			os.Exit(0)
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		if input == "-1" || input == "cancel" {
+			return -1
+		}
+
+		// 解析十六进制
+		addr, err := strconv.ParseInt(input, 16, 16)
+		if err != nil {
+			fmt.Printf("✗ 输入格式有误：%v，请输入两位十六进制数字（如 05）\n", err)
+			continue
+		}
+
+		if addr < 0 || addr > 0xFFFF {
+			fmt.Println("✗ 地址范围应为 0x0000 ~ 0xFFFF")
+			continue
+		}
+
+		fmt.Printf("✓ 已选择设备地址：0x%04X\n", addr)
+		return int(addr)
+	}
+}
+
+// promptForWorkMode 提示用户选择工作模式。
+func promptForWorkMode(scanner *bufio.Scanner) int {
+	for {
+		fmt.Print("请选择工作模式（0=主动 1=被动 2=触发，或 -1 取消）> ")
+		if !scanner.Scan() {
+			fmt.Println("\n输入中断，程序退出。")
+			os.Exit(0)
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		if input == "-1" || input == "cancel" {
+			return -1
+		}
+
+		mode, err := strconv.Atoi(input)
+		if err != nil || mode < 0 || mode > 2 {
+			fmt.Println("✗ 请输入 0、1 或 2")
+			continue
+		}
+
+		modeStr := []string{"主动模式", "被动模式", "触发模式"}[mode]
+		fmt.Printf("✓ 已选择：%s\n", modeStr)
+		return mode
+	}
+}
+
+// printStatusCodeDescription 根据错误码打印详细说明（参考CPH协议文档）。
+func printStatusCodeDescription(code byte) {
+	descriptions := map[byte]string{
+		0x00: "SUCCESS - 命令成功完成",
+		0x14: "Parameter unsupport - 不支持的参数",
+		0x15: "Parameter len error - 参数长度有误",
+		0x16: "Parameter context error - 参数内容有误",
+		0x17: "Unsupport command - 不支持的命令",
+		0x18: "Device Address error - 设备地址不符",
+		0x20: "Check Sum error - 校验码错误",
+		0x21: "Unsupport TLV Type - 不支持的TLV类型",
+		0x22: "Flash Error - Flash写入错误",
+		0xFF: "Internal Error - 内部错误",
+	}
+
+	if desc, ok := descriptions[code]; ok {
+		fmt.Printf("  错误说明：%s\n", desc)
+	} else {
+		fmt.Printf("  未知错误码：0x%02X\n", code)
+	}
+}
