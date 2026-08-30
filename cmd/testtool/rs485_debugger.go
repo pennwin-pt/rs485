@@ -3,8 +3,17 @@
 // 用法:
 //
 //	go build -o rs485-debugger.exe ./cmd
-//	rs485-debugger.exe 192.168.1.100
-//	rs485-debugger.exe 192.168.1.100:8899 10
+//	rs485-debugger.exe
+//	rs485-debugger.exe motorIP=192.168.2.170 motorPort=8001 readerIP=127.0.0.1 readerPort=8003
+//	rs485-debugger.exe motorIP=192.168.2.170 delaySeconds=10
+//
+// 所有参数都是 key=value 形式，每一个都可以不设，不设就用各自的 default 常量：
+//
+//	motorIP / motorHost     继电器（RS485/TCP）主机地址，默认 defaultMotorHost
+//	motorPort               继电器端口，默认 defaultMotorPort
+//	readerIP / readerHost   RFID 读卡器主机地址；不单独指定时，默认和 motorIP 用同一个主机
+//	readerPort              RFID 读卡器端口，默认 defaultReaderPort
+//	delaySeconds / delay    组合/verify 模式里"保持"多少秒后自动发送关闭指令，默认 defaultDelaySeconds
 //
 // 启动后进入循环：每一轮先选择本轮要用的模式：
 //
@@ -46,15 +55,24 @@ import (
 )
 
 const (
-	defaultPort           = "8001"
-	defaultCardReaderPort = "8003"
-	defaultHost           = "192.168.2.170"
-	defaultTarget         = defaultHost + ":" + defaultPort
-	defaultDelaySeconds   = 12 // 未指定关闭延时时使用的默认秒数
-	warnAheadSeconds      = 1  // 发送关闭指令前多少秒开始提示“即将发送”
-	readTimeout           = 1 * time.Second
-	connectTimeout        = 5 * time.Second
-	payloadLen            = 6 // 用户输入固定 6 字节，CRC-16 占 2 字节，共发送 8 字节
+	defaultMotorHost    = "192.168.2.170" // 继电器（RS485/TCP）默认主机地址
+	defaultMotorPort    = "8001"          // 继电器默认端口
+	defaultReaderPort   = "8003"          // RFID 读卡器默认端口
+	defaultDelaySeconds = 12              // 未指定关闭延时时使用的默认秒数
+	warnAheadSeconds    = 1               // 发送关闭指令前多少秒开始提示“即将发送”
+	readTimeout         = 1 * time.Second
+	connectTimeout      = 5 * time.Second
+	payloadLen          = 6 // 用户输入固定 6 字节，CRC-16 占 2 字节，共发送 8 字节
+)
+
+// 程序运行期间实际生效的连接配置——默认等于上面的 default* 常量，
+// 可以通过命令行参数（motorIP=/motorPort=/readerIP=/readerPort=）覆盖，
+// 覆盖后程序里所有用到目标地址的地方都统一读这几个变量，不再直接写死用常量。
+var (
+	motorHost  = defaultMotorHost
+	motorPort  = defaultMotorPort
+	readerHost = defaultMotorHost // 未单独指定 readerIP 时，默认和 motorIP 用同一台主机
+	readerPort = defaultReaderPort
 )
 
 type runMode int
@@ -80,27 +98,9 @@ const cardModeDuration = 1 * time.Second
 const cardModePollInterval = 130 * time.Millisecond
 
 func main() {
-	var target string
-	if len(os.Args) < 2 {
-		target = defaultTarget
-		fmt.Printf("未指定目标地址，使用默认值：%s\n", target)
-	} else {
-		target = os.Args[1]
-	}
+	delaySeconds := parseArgs(os.Args[1:])
 
-	delaySeconds := defaultDelaySeconds
-	if len(os.Args) >= 3 {
-		if v, err := strconv.Atoi(strings.TrimSpace(os.Args[2])); err == nil && v > 0 {
-			delaySeconds = v
-		} else {
-			fmt.Printf("关闭延时参数无效，使用默认值：%d 秒\n", defaultDelaySeconds)
-		}
-	} else {
-		fmt.Printf("未指定关闭延时，使用默认值：%d 秒\n", defaultDelaySeconds)
-	}
-
-	host, port := parseTarget(target)
-	addr := net.JoinHostPort(host, port)
+	addr := net.JoinHostPort(motorHost, motorPort)
 
 	printBanner(addr, delaySeconds)
 
@@ -278,7 +278,7 @@ func runVerifiedChannel(addr string, scanner *bufio.Scanner, delaySeconds int, p
 // motorReaderMap 里 ReaderInfo.Address 字段（这是原代码的既有行为，这次只是搬家，不改行为）。
 func runPresetCard(presetName string, deviceAddr byte) {
 	fmt.Printf("\n【预设：%s】连续查询地址码 0x%02X 对应读卡器的卡号列表：\n", presetName, deviceAddr)
-	ip, port := defaultHost, defaultCardReaderPort
+	ip, port := readerHost, readerPort
 	if _, err := rs485.QueryCardsRepeated(uint16(deviceAddr), ip, port, cardModeDuration, cardModePollInterval); err != nil {
 		fmt.Printf("  ✗ 查询失败：%v\n", err)
 	}
@@ -307,7 +307,7 @@ func runCardMode(scanner *bufio.Scanner, presetAddr int) {
 // 已删除），行为保持不变。
 func runPresetCardOnce(presetName string, deviceAddr byte) {
 	fmt.Printf("\n【预设：%s】只读一次地址码 0x%02X 对应读卡器的卡号：\n", presetName, deviceAddr)
-	ip, port := defaultHost, defaultCardReaderPort
+	ip, port := readerHost, readerPort
 	if _, err := rs485.QueryCardsOnce(uint16(deviceAddr), ip, port); err != nil {
 		fmt.Printf("  ✗ 查询失败：%v\n", err)
 	}
@@ -507,7 +507,8 @@ func printBanner(addr string, delaySeconds int) {
 	fmt.Println("========================================")
 	fmt.Println("  RS485 TCP 指令发送工具 + RFID读写器工作模式设置")
 	fmt.Println("========================================")
-	fmt.Printf("目标设备：%s\n", addr)
+	fmt.Printf("继电器目标地址：%s\n", addr)
+	fmt.Printf("读卡器目标地址：%s\n", net.JoinHostPort(readerHost, readerPort))
 	fmt.Printf("关闭延时：%d 秒\n", delaySeconds)
 	fmt.Println()
 	fmt.Println("使用说明：")
@@ -533,11 +534,64 @@ func printBanner(addr string, delaySeconds int) {
 	fmt.Println("========================================")
 }
 
-func parseTarget(arg string) (host, port string) {
-	if h, p, err := net.SplitHostPort(arg); err == nil {
-		return h, p
+// parseArgs 解析命令行参数，形如 key=value（大小写不敏感），支持：
+//
+//	motorIP / motorHost     继电器主机地址 → 覆盖包级变量 motorHost
+//	motorPort               继电器端口     → 覆盖包级变量 motorPort
+//	readerIP / readerHost   读卡器主机地址 → 覆盖包级变量 readerHost
+//	readerPort              读卡器端口     → 覆盖包级变量 readerPort
+//	delaySeconds / delay    关闭延时（秒） → 返回值 delaySeconds
+//
+// 每一项都可以不传，不传就保持 motorHost/motorPort/readerHost/readerPort 的 default* 初始值；
+// 没有单独指定 readerIP 时，readerHost 会跟随最终生效的 motorHost（沿用原来"读卡器和继电器
+// 共用同一台主机"的行为）。无法识别的参数或非法的值只打印提示，不会中断程序。
+func parseArgs(args []string) int {
+	delaySeconds := defaultDelaySeconds
+	readerHostSet := false
+
+	for _, arg := range args {
+		idx := strings.Index(arg, "=")
+		if idx < 0 {
+			fmt.Printf("忽略无法识别的参数：%q（应为 key=value 形式，如 motorIP=192.168.2.170）\n", arg)
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(arg[:idx]))
+		val := strings.TrimSpace(arg[idx+1:])
+		if val == "" {
+			fmt.Printf("参数 %s 的值为空，已忽略。\n", key)
+			continue
+		}
+
+		switch key {
+		case "motorip", "motorhost":
+			motorHost = val
+		case "motorport":
+			motorPort = val
+		case "readerip", "readerhost":
+			readerHost = val
+			readerHostSet = true
+		case "readerport":
+			readerPort = val
+		case "delayseconds", "delay":
+			if v, err := strconv.Atoi(val); err == nil && v > 0 {
+				delaySeconds = v
+			} else {
+				fmt.Printf("参数 %s 的值 %q 无效，使用默认值：%d 秒\n", key, val, defaultDelaySeconds)
+			}
+		default:
+			fmt.Printf("忽略无法识别的参数：%q\n", arg)
+		}
 	}
-	return arg, defaultPort
+
+	if !readerHostSet {
+		readerHost = motorHost
+	}
+
+	fmt.Printf("继电器地址：%s（未指定项已用默认值）\n", net.JoinHostPort(motorHost, motorPort))
+	fmt.Printf("读卡器地址：%s（未指定项已用默认值）\n", net.JoinHostPort(readerHost, readerPort))
+	fmt.Printf("关闭延时：%d 秒\n", delaySeconds)
+
+	return delaySeconds
 }
 
 // buildPayloadWithCRC 把用户输入的十六进制字符串（支持空格/逗号等分隔，也支持不分隔，
