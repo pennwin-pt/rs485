@@ -30,10 +30,12 @@
 //	  结束后打印命中/未命中次数汇总和读到的卡号列表。
 //	· 输入 card1             → 只读一次模式：用法与 card 一致，输入十进制设备地址后
 //	  只发送一次查询指令、只读一次响应，立即打印结果，不做 2 秒轮询。
-//	· 输入 mode / workmode  → 【新功能】设置 RFID 读写器工作模式：支持自定义设备地址，选择主动/被动/触发模式。
-//	· 输入 verify / vf      → 【新功能】带确认重试的开→保持→关：输入十进制设备地址后，
+//	· 输入 mode / workmode  → 设置 RFID 读写器工作模式：支持自定义设备地址，选择主动/被动/触发模式。
+//	· 输入 verify / vf      → 带确认重试的开→保持→关：输入十进制设备地址后，
 //	  每一步（开/关）发送指令后都会查询继电器实际状态确认是否生效，不符合预期会自动重发，
 //	  最多重试 5 次，直接调用 rs485 库里导出的 rs485.SendChannelWithVerify。
+//	· 输入 ip / conn        → 修改继电器/读卡器的 IP 和端口：每一项可直接回车跳过
+//	  （保持当前值不变），改完立即生效，不需要重启程序。
 //	· 输入 q / quit / exit  → 退出程序。
 //
 // 每一轮流程结束后会自动回到模式选择，可重复执行任意次。
@@ -86,6 +88,7 @@ const (
 	modeCard1                      // 只读一次模式：交互式输入十进制设备地址，只发送并读取一次
 	modeSetWorkMode                // 设置RFID读写器工作模式（主动/被动/触发）
 	modeVerify                     // 带确认重试的开→保持→关：交互式输入十进制设备地址
+	modeSetConn                    // 修改连接配置：交互式修改电机/读卡器的 IP 和端口
 )
 
 var hexCleanRE = regexp.MustCompile(`[\s,:-]+`)
@@ -137,6 +140,12 @@ func main() {
 
 		case modeVerify:
 			runVerifiedChannel(addr, scanner, delaySeconds, presetAddr)
+
+		case modeSetConn:
+			runSetConnMode(scanner)
+			// 电机（继电器）地址可能被改了，addr 要重新拼一次，
+			// 后面几轮循环里 up/down/check/card/verify/单指令模式都会用到这个变量。
+			addr = net.JoinHostPort(motorHost, motorPort)
 		}
 	}
 }
@@ -368,6 +377,7 @@ func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 	fmt.Println("  card1          → 只读一次模式：用法同 card，只发送并读取一次查询指令，不做2秒轮询；也可以直接输入 \"card1 5\" 一次带上地址")
 	fmt.Println("  mode           → 设置RFID读写器工作模式（主动/被动/触发）- 支持自定义设备地址；也可以直接输入 \"mode 5\" 一次带上地址")
 	fmt.Println("  verify         → 带确认重试的开→保持→关：输入后再输入十进制设备地址，每步发送指令都会查询继电器状态确认生效，不符合预期自动重发（最多5次）；也可以直接输入 \"verify 5\" 一次带上地址")
+	fmt.Println("  ip / conn      → 修改继电器/读卡器的 IP 和端口（当前：继电器 " + net.JoinHostPort(motorHost, motorPort) + "，读卡器 " + net.JoinHostPort(readerHost, readerPort) + "）")
 	fmt.Println("  q / quit / exit → 退出程序")
 	fmt.Print("请选择 > ")
 
@@ -406,6 +416,8 @@ func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 		return modeSetWorkMode, presetAddr
 	case "verify", "vf":
 		return modeVerify, presetAddr
+	case "ip", "conn", "setip", "setconn":
+		return modeSetConn, presetAddr
 	case "q", "quit", "exit":
 		return modeQuit, presetAddr
 	default:
@@ -509,13 +521,55 @@ func printBanner(addr string, delaySeconds int) {
 	fmt.Println("  · card：读卡模式，输入后再输入十进制设备地址（如 0/1/5），连续读卡2秒（每50ms查询一次）并汇总命中/未命中次数")
 	fmt.Println("  · card1：只读一次模式，用法同 card，只发送并读取一次查询指令，不做2秒轮询")
 	fmt.Println("  · verify：带确认重试的 开→保持→关，输入设备地址后每步发送指令都会查询继电器状态确认生效，不符合预期自动重发（最多5次）")
-	fmt.Println("  · 【新】mode/workmode：设置RFID读写器工作模式，支持自定义设备地址")
+	fmt.Println("  · ip/conn：修改继电器/读卡器的 IP 和端口，每一项可直接回车跳过（保持不变），改完立即生效")
+	fmt.Println("  · mode/workmode：设置RFID读写器工作模式，支持自定义设备地址")
 	fmt.Println("    └─ 主动模式（0）：上电后自动盘寻，接收指令可继续或停止")
 	fmt.Println("    └─ 被动模式（1）：上电后不盘寻，接收指令后盘寻一次并停止")
 	fmt.Println("    └─ 触发模式（2）：只有触发线有信号时才读卡")
 	fmt.Println("  · up/down/check/card/card1/verify/mode 里的设备地址统一用【十进制】输入（如 0、1、5、17）")
 	fmt.Println("  · 在模式选择处输入 quit / exit / q 可退出程序")
 	fmt.Println("========================================")
+}
+
+// runSetConnMode 交互式修改继电器（电机）和读卡器的 IP、端口。
+// 每一项都可以直接回车跳过，跳过的项保持当前值不变；改完立即打印生效后的完整连接配置。
+//
+// 🌟 这里改的是包级变量 motorHost/motorPort/readerHost/readerPort，程序里所有用到
+// 目标地址的地方读的都是这几个变量，所以改完对后续所有模式（up/down/check/card/verify/
+// 单个指令等）立即生效，不需要重启程序。
+func runSetConnMode(scanner *bufio.Scanner) {
+	fmt.Println("\n【修改连接配置】每一项直接回车表示不改，保持当前值。")
+
+	fmt.Printf("继电器 IP（当前 %s）> ", motorHost)
+	if v := promptOptionalLine(scanner); v != "" {
+		motorHost = v
+	}
+	fmt.Printf("继电器端口（当前 %s）> ", motorPort)
+	if v := promptOptionalLine(scanner); v != "" {
+		motorPort = v
+	}
+	fmt.Printf("读卡器 IP（当前 %s）> ", readerHost)
+	if v := promptOptionalLine(scanner); v != "" {
+		readerHost = v
+	}
+	fmt.Printf("读卡器端口（当前 %s）> ", readerPort)
+	if v := promptOptionalLine(scanner); v != "" {
+		readerPort = v
+	}
+
+	fmt.Println("✓ 已更新，当前生效的连接配置：")
+	fmt.Printf("  继电器地址：%s\n", net.JoinHostPort(motorHost, motorPort))
+	fmt.Printf("  读卡器地址：%s\n", net.JoinHostPort(readerHost, readerPort))
+}
+
+// promptOptionalLine 读取一行输入并去除首尾空白；用户直接回车（空行）时返回空字符串，
+// 调用方将其视为"不修改，保持原值"。
+func promptOptionalLine(scanner *bufio.Scanner) string {
+	if !scanner.Scan() {
+		fmt.Println("\n输入中断，程序退出。")
+		os.Exit(0)
+	}
+	return strings.TrimSpace(scanner.Text())
 }
 
 // parseArgs 解析命令行参数，形如 key=value（大小写不敏感），支持：
