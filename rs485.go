@@ -46,16 +46,20 @@ const (
 	steppedSleepUnit = 100 * time.Millisecond
 )
 
+// RF*/RFTLV* 是 UHF RFID《CPH 通信协议》里用到的帧类型/命令码/TLV 类型常量。
+// 导出这些常量以及下面的 CardRFFrame/BuildCardRFFrame/ReadCardRFFrame/ParseCardRFTLVs/
+// ExtractCardsFromTagTLVs，是为了让 cmd/rs485-debugger（trap_monitor.go、
+// rs485_debugger.go）不用再各自复制一份完全相同的协议解析/组帧代码。
 const (
-	rfFrameTypeCommand  byte = 0x00
-	rfFrameTypeResponse byte = 0x01
-	rfFrameTypeNotify   byte = 0x02
+	RFFrameTypeCommand  byte = 0x00
+	RFFrameTypeResponse byte = 0x01
+	RFFrameTypeNotify   byte = 0x02
 
-	rfCmdSingleInventory byte = 0x22 // 主动盘存标签：读一次就停
+	RFCmdSingleInventory byte = 0x22 // 主动盘存标签：读一次就停
 
-	rfTLVStatus    byte = 0x07 // 状态 TLV
-	rfTLVSingleTag byte = 0x50 // 单张标签 TLV（内部还嵌套 EPC/RSSI/Time 等 TLV）
-	rfTLVEPC       byte = 0x01 // EPC TLV，值就是卡号
+	RFTLVStatus    byte = 0x07 // 状态 TLV
+	RFTLVSingleTag byte = 0x50 // 单张标签 TLV（内部还嵌套 EPC/RSSI/Time 等 TLV）
+	RFTLVEPC       byte = 0x01 // EPC TLV，值就是卡号
 )
 
 func FormatHex(data []byte) string {
@@ -167,10 +171,13 @@ const (
 	RelayM3 RelayBit = 0x04
 )
 
-// relayBitForChannel 把 BuildChannelPayload 里用来选择"开哪一路"的 channel 参数
+// RelayBitForChannel 把 BuildChannelPayload 里用来选择"开哪一路"的 channel 参数
 // (ChannelUp / ChannelDown)，映射到查询回包状态字节里对应要核对的硬件位：
 // 上升指令 / 上升停止指令都作用在 M1 上，下降指令 / 下降停止指令都作用在 M2 上。
-func relayBitForChannel(channel byte) RelayBit {
+//
+// 导出这个函数是为了让需要"自己查询+核对继电器状态"的调用方（比如 rs485-debugger）
+// 不用再复制一份同样的映射规则。
+func RelayBitForChannel(channel byte) RelayBit {
 	if channel == ChannelUp {
 		return RelayM1
 	}
@@ -218,14 +225,28 @@ func QueryRelayStatus(addr string, deviceAddr byte) (byte, error) {
 	return resp[5], nil
 }
 
-// sendChannelWithVerify 发送一次开/关指令后，隔 verifyQueryDelay 用 QueryRelayStatus
-// 查一次硬件实际状态，确认是否变成了期望的 on/off；如果没变化（大概率是总线撞车、
-// 指令没被设备真正执行），就重新发送 + 重新查询，最多尝试 maxVerifyAttempts 次。
+// DefaultVerifyMaxAttempts / DefaultVerifyQueryDelay 是 SendChannelWithVerify 的建议默认值：
+// 最多尝试 5 次（含第一次），每次发送后等 300ms 再查询硬件状态确认。
+// 导出这两个默认值是为了让调用方（比如 rs485-debugger）不用自己再定义一遍同样的数字。
+const (
+	DefaultVerifyMaxAttempts = maxVerifyAttempts
+	DefaultVerifyQueryDelay  = verifyQueryDelay
+)
+
+// sendChannelWithVerify 是 SendOpen/SendClose 与导出的 SendChannelWithVerify 共用的核心实现。
 //
-// 🌟 发送本身失败（网络层面）和"发送成功但状态没变"都会触发重试，统一走同一条路径，
+//   - verify == false：发送成功即视为生效，不做二次查询确认——这是 SendOpen/SendClose
+//     目前在生产环境（CommandAgent）里的既有行为（🚨 之前这里通过注释掉查询逻辑的方式
+//     临时实现，现在改成显式的 verify 参数，行为不变，只是不用再靠读代码猜"这段为什么被注释掉"）。
+//   - verify == true：每次发送后隔 queryDelay 用 QueryRelayStatus 查一次硬件实际状态，
+//     确认是否变成了期望的 on/off；不符合预期（或查询本身失败）就重新发送+重新查询，
+//     最多尝试 maxAttempts 次（含第一次）。这是需要"真正确认硬件状态是否改变"的调用方
+//     （目前是 rs485-debugger 的 verify 模式）需要的行为。
+//
+// 🌟 发送失败（网络层面）和"发送成功但状态没变"都会触发重试，统一走同一条路径，
 // 直到最后一次尝试仍不满足才把最后一次的错误信息返回出去。
-func sendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool) error {
-	//bit := byte(relayBitForChannel(channel))
+func sendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool, verify bool, maxAttempts int, queryDelay time.Duration) error {
+	bit := byte(RelayBitForChannel(channel))
 	payload := BuildChannelPayload(deviceAddr, channel, on)
 
 	action := "关闭"
@@ -236,45 +257,65 @@ func sendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool) 
 	log.Printf("[RS485][%s] 设备 0x%02X 通道 0x%02X：开始下发指令，网关=%s，报文=% X", action, deviceAddr, channel, addr, payload)
 
 	var lastErr error
-	for attempt := 1; attempt <= maxVerifyAttempts; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 
 		if err := SendFrame(addr, payload); err != nil {
-			lastErr = fmt.Errorf("第 %d/%d 次发送指令失败: %w", attempt, maxVerifyAttempts, err)
-			log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次发送失败: %v", action, deviceAddr, attempt, maxVerifyAttempts, err)
+			lastErr = fmt.Errorf("第 %d/%d 次发送指令失败: %w", attempt, maxAttempts, err)
+			log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次发送失败: %v", action, deviceAddr, attempt, maxAttempts, err)
 			continue
 		}
-		log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次发送成功，%v 后查询硬件状态确认...", action, deviceAddr, attempt, maxVerifyAttempts, verifyQueryDelay)
 
-		// FIXME：下面是暂时的不查
-		log.Printf("[RS485][%s] 设备 0x%02X 第 %d 次尝试确认生效", action, deviceAddr, attempt)
-		return nil // 硬件状态已经符合预期，发送确认生效
-		/*
-			time.Sleep(verifyQueryDelay)
+		if !verify {
+			log.Printf("[RS485][%s] 设备 0x%02X 第 %d 次发送成功，不做二次查询确认，视为已生效", action, deviceAddr, attempt)
+			return nil
+		}
 
+		log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次发送成功，%v 后查询硬件状态确认...", action, deviceAddr, attempt, maxAttempts, queryDelay)
+		time.Sleep(queryDelay)
 
-			status, err := QueryRelayStatus(addr, deviceAddr)
-			if err != nil {
-				// 查询本身失败（比如网关连不上），无法确认是否生效，保守地当作一次失败重试。
-				lastErr = fmt.Errorf("第 %d/%d 次发送后查询硬件状态失败: %w", attempt, maxVerifyAttempts, err)
-				log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次查询状态失败: %v", action, deviceAddr, attempt, maxVerifyAttempts, err)
-				continue
-			}
+		status, err := QueryRelayStatus(addr, deviceAddr)
+		if err != nil {
+			// 查询本身失败（比如网关连不上），无法确认是否生效，保守地当作一次失败重试。
+			lastErr = fmt.Errorf("第 %d/%d 次发送后查询硬件状态失败: %w", attempt, maxAttempts, err)
+			log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次查询状态失败: %v", action, deviceAddr, attempt, maxAttempts, err)
+			continue
+		}
 
-			actualOn := status&bit != 0
-			log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次查询回包状态字节=0x%02X，期望开=%v，实际开=%v", action, deviceAddr, attempt, maxVerifyAttempts, status, on, actualOn)
+		actualOn := status&bit != 0
+		log.Printf("[RS485][%s] 设备 0x%02X 第 %d/%d 次查询回包状态字节=0x%02X，期望开=%v，实际开=%v", action, deviceAddr, attempt, maxAttempts, status, on, actualOn)
 
-			if actualOn == on {
-				log.Printf("[RS485][%s] 设备 0x%02X 第 %d 次尝试确认生效", action, deviceAddr, attempt)
-				return nil // 硬件状态已经符合预期，发送确认生效
-			}
-			lastErr = fmt.Errorf("第 %d/%d 次发送后硬件状态未按预期变化（期望开=%v，实际状态字节=0x%02X）", attempt, maxVerifyAttempts, on, status)
-			if attempt < maxVerifyAttempts {
-				log.Printf("[RS485][%s] 设备 0x%02X 状态未变化，准备第 %d 次重试", action, deviceAddr, attempt+1)
-			}*/
+		if actualOn == on {
+			log.Printf("[RS485][%s] 设备 0x%02X 第 %d 次尝试确认生效", action, deviceAddr, attempt)
+			return nil
+		}
+		lastErr = fmt.Errorf("第 %d/%d 次发送后硬件状态未按预期变化（期望开=%v，实际状态字节=0x%02X）", attempt, maxAttempts, on, status)
+		if attempt < maxAttempts {
+			log.Printf("[RS485][%s] 设备 0x%02X 状态未变化，准备第 %d 次重试", action, deviceAddr, attempt+1)
+		}
 	}
 
-	log.Printf("[RS485][%s] 设备 0x%02X 重试 %d 次后仍未确认生效，放弃", action, deviceAddr, maxVerifyAttempts)
-	return fmt.Errorf("%s指令重试 %d 次后仍未确认生效: %w", action, maxVerifyAttempts, lastErr)
+	log.Printf("[RS485][%s] 设备 0x%02X 重试 %d 次后仍未确认生效，放弃", action, deviceAddr, maxAttempts)
+	return fmt.Errorf("%s指令重试 %d 次后仍未确认生效: %w", action, maxAttempts, lastErr)
+}
+
+// SendChannelWithVerify 发送一次开/关指令，并在每次发送后真正查询硬件实际状态，
+// 确认是否变成了期望的 on/off；不符合预期就重新发送+重新查询，最多尝试 maxAttempts 次
+// （maxAttempts <= 0 时使用 DefaultVerifyMaxAttempts；queryDelay <= 0 时使用
+// DefaultVerifyQueryDelay）。
+//
+// 🌟 与 SendOpen/SendClose 的区别：SendOpen/SendClose 目前只负责把指令发出去、
+// 不做二次查询确认（CommandAgent 生产环境的既有行为，见 sendChannelWithVerify 的注释）；
+// 这个函数是给需要"真正确认硬件状态是否改变"的场景用的，目前唯一的调用方是
+// rs485-debugger 的 verify 模式。导出它是为了让 rs485-debugger 不用再自己复制一份
+// 一模一样的"发送→查询→重试"逻辑。
+func SendChannelWithVerify(addr string, deviceAddr byte, channel byte, on bool, maxAttempts int, queryDelay time.Duration) error {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultVerifyMaxAttempts
+	}
+	if queryDelay <= 0 {
+		queryDelay = DefaultVerifyQueryDelay
+	}
+	return sendChannelWithVerify(addr, deviceAddr, channel, on, true, maxAttempts, queryDelay)
 }
 
 // RunUpDownStepped 和 RunUpDown 逻辑完全一致（开 -> 保持 -> 关），
@@ -302,7 +343,7 @@ func RunUpDownStepped(addr string, deviceAddr byte, channel byte, holdSeconds fl
 // 🌟 内部已经带上"发送后查询硬件状态确认 + 最多重试 5 次"的逻辑（见 sendChannelWithVerify），
 // 调用方（包括 CommandAgent）不需要也不应该再自己重复发送或重试。
 func SendOpen(addr string, deviceAddr byte, channel byte) error {
-	if err := sendChannelWithVerify(addr, deviceAddr, channel, true); err != nil {
+	if err := sendChannelWithVerify(addr, deviceAddr, channel, true, false, maxVerifyAttempts, verifyQueryDelay); err != nil {
 		return fmt.Errorf("发送开启指令失败: %w", err)
 	}
 	return nil
@@ -311,7 +352,7 @@ func SendOpen(addr string, deviceAddr byte, channel byte) error {
 // SendClose 发送「关」指令，对应 SendOpen，同样带有"发送后查询确认 + 重试"逻辑，
 // 同样不掺杂任何额外的等待/调度逻辑（那是 CommandAgent 的职责）。
 func SendClose(addr string, deviceAddr byte, channel byte) error {
-	if err := sendChannelWithVerify(addr, deviceAddr, channel, false); err != nil {
+	if err := sendChannelWithVerify(addr, deviceAddr, channel, false, false, maxVerifyAttempts, verifyQueryDelay); err != nil {
 		return fmt.Errorf("发送关闭指令失败: %w", err)
 	}
 	return nil
@@ -368,10 +409,10 @@ func QueryDeviceTrigger(addr string, deviceAddr byte, readTimeout time.Duration)
 //
 // ==============================================================
 
-// readCardRFFrame 从连接里读取并校验一条完整的 CPH 协议帧。
+// ReadCardRFFrame 从连接里读取并校验一条完整的 CPH 协议帧。
 // 除了解析结果和 error，还会把目前为止实际读到的原始字节一并返回（哪怕解析失败/读取出错也会返回已读到的部分），
 // 方便调用方在打印调试信息时，无论成功失败都能看到“收到了什么”。
-func readCardRFFrame(reader *bufio.Reader) (*cardRfFrame, []byte, error) {
+func ReadCardRFFrame(reader *bufio.Reader) (*CardRFFrame, []byte, error) {
 	var raw []byte
 
 	header := make([]byte, 2)
@@ -413,7 +454,7 @@ func readCardRFFrame(reader *bufio.Reader) (*cardRfFrame, []byte, error) {
 		return nil, raw, fmt.Errorf("校验和不匹配：期望 %02X 实际 %02X", want, checksumByte[0])
 	}
 
-	return &cardRfFrame{
+	return &CardRFFrame{
 		FrameType: rest[0],
 		Address:   uint16(rest[1])<<8 | uint16(rest[2]),
 		FrameCode: rest[3],
@@ -430,16 +471,16 @@ func CardRfChecksum(data []byte) byte {
 	return ^sum + 1
 }
 
-// extractCardsFromTagTLVs 从响应帧的参数里找出所有“单张标签 TLV(0x50)”，
+// ExtractCardsFromTagTLVs 从响应帧的参数里找出所有“单张标签 TLV(0x50)”，
 // 再从每一个里面取出 EPC TLV(0x01) 的值作为卡号（十六进制字符串）。
-func extractCardsFromTagTLVs(params []byte) []string {
+func ExtractCardsFromTagTLVs(params []byte) []string {
 	var cards []string
-	for _, t := range parseCardRFTLVs(params) {
-		if t.Type != rfTLVSingleTag {
+	for _, t := range ParseCardRFTLVs(params) {
+		if t.Type != RFTLVSingleTag {
 			continue
 		}
-		for _, inner := range parseCardRFTLVs(t.Value) {
-			if inner.Type == rfTLVEPC {
+		for _, inner := range ParseCardRFTLVs(t.Value) {
+			if inner.Type == RFTLVEPC {
 				cards = append(cards, strings.ToUpper(hex.EncodeToString(inner.Value)))
 			}
 		}
@@ -447,23 +488,23 @@ func extractCardsFromTagTLVs(params []byte) []string {
 	return cards
 }
 
-// cardRfTLV 是一条通用 TLV：1 字节类型 + 1 字节长度 + N 字节值。
-type cardRfTLV struct {
+// CardRFTLV 是一条通用 TLV：1 字节类型 + 1 字节长度 + N 字节值。
+type CardRFTLV struct {
 	Type  byte
 	Value []byte
 }
 
-// cardRfFrame 是解析出来的一条 CPH 协议帧。
-type cardRfFrame struct {
+// CardRFFrame 是解析出来的一条 CPH 协议帧。
+type CardRFFrame struct {
 	FrameType byte
 	Address   uint16
 	FrameCode byte
 	Params    []byte
 }
 
-// parseCardRFTLVs 按 Type(1) Length(1) Value(N) 的格式顺序切出所有 TLV。
-func parseCardRFTLVs(data []byte) []cardRfTLV {
-	var out []cardRfTLV
+// ParseCardRFTLVs 按 Type(1) Length(1) Value(N) 的格式顺序切出所有 TLV。
+func ParseCardRFTLVs(data []byte) []CardRFTLV {
+	var out []CardRFTLV
 	i := 0
 	for i+2 <= len(data) {
 		t := data[i]
@@ -472,14 +513,14 @@ func parseCardRFTLVs(data []byte) []cardRfTLV {
 		if i+l > len(data) {
 			break // 数据不完整，直接放弃剩余部分
 		}
-		out = append(out, cardRfTLV{Type: t, Value: data[i : i+l]})
+		out = append(out, CardRFTLV{Type: t, Value: data[i : i+l]})
 		i += l
 	}
 	return out
 }
 
-// buildCardRFFrame 拼出一条完整的 CPH 协议帧（命令帧用 rfFrameTypeCommand）。
-func buildCardRFFrame(frameType byte, address uint16, frameCode byte, params []byte) []byte {
+// BuildCardRFFrame 拼出一条完整的 CPH 协议帧（命令帧用 RFFrameTypeCommand）。
+func BuildCardRFFrame(frameType byte, address uint16, frameCode byte, params []byte) []byte {
 	frame := make([]byte, 0, 8+len(params))
 	frame = append(frame, 'R', 'F', frameType, byte(address>>8), byte(address&0xFF), frameCode)
 	frame = append(frame, byte(len(params)>>8), byte(len(params)&0xFF))
@@ -522,7 +563,7 @@ func QueryCardsRepeated(readerAddr uint16, readerIP, readerPort string, duration
 			continue
 		}
 
-		cmd := buildCardRFFrame(rfFrameTypeCommand, readerAddr, rfCmdSingleInventory, nil)
+		cmd := BuildCardRFFrame(RFFrameTypeCommand, readerAddr, RFCmdSingleInventory, nil)
 		if _, err := conn.Write(cmd); err != nil {
 			log.Printf("  [%3d] ✗ 发送失败：%v\n", attempt, err)
 			missCount++
@@ -530,7 +571,7 @@ func QueryCardsRepeated(readerAddr uint16, readerIP, readerPort string, duration
 			continue
 		}
 
-		resp, raw, err := readCardRFFrame(bufReader)
+		resp, raw, err := ReadCardRFFrame(bufReader)
 		if err != nil {
 			log.Printf("  [%3d] ✗ 未读到有效响应：%v（原始字节：%s）\n", attempt, err, FormatHex(raw))
 			missCount++
@@ -538,14 +579,14 @@ func QueryCardsRepeated(readerAddr uint16, readerIP, readerPort string, duration
 			continue
 		}
 
-		tlvs := parseCardRFTLVs(resp.Params)
-		if len(tlvs) > 0 && tlvs[0].Type == rfTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
+		tlvs := ParseCardRFTLVs(resp.Params)
+		if len(tlvs) > 0 && tlvs[0].Type == RFTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
 			log.Printf("  [%3d] ✗ 未读到卡（状态码 %02X）\n", attempt, tlvs[0].Value[0])
 			missCount++
 			continue
 		}
 
-		cards := extractCardsFromTagTLVs(resp.Params)
+		cards := ExtractCardsFromTagTLVs(resp.Params)
 		if len(cards) == 0 {
 			log.Printf("  [%3d] ✗ 未读到卡\n", attempt)
 			missCount++
@@ -579,4 +620,57 @@ func QueryCardsRepeated(readerAddr uint16, readerIP, readerPort string, duration
 		}
 	}
 	return cardHitCounts, nil
+}
+
+// QueryCardsOnce 只读一次：连接读卡器，发送一次“主动盘存标签(0x22)”指令，
+// 读取一次响应并解析出卡号列表（去重、按字典序排序），不重试、不轮询，
+// 读完（无论命中与否）立即返回。
+//
+// 与 QueryCardsRepeated 的区别：后者在 duration 时间内每隔 interval 反复查询并统计命中次数，
+// 这里只发一次、只读一次，适合"点一下就看结果"的交互式调试场景。
+func QueryCardsOnce(readerAddr uint16, readerIP, readerPort string) ([]string, error) {
+	addr := net.JoinHostPort(readerIP, readerPort)
+
+	log.Printf("  → 连接读卡器 %s ...\n", addr)
+
+	conn, err := net.DialTimeout("tcp", addr, DefaultDialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("连接失败: %w", err)
+	}
+	defer conn.Close()
+
+	log.Println("  → 只读一次（发送一次查询指令，读取一次响应）")
+
+	if err := conn.SetDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
+		return nil, fmt.Errorf("设置超时失败: %w", err)
+	}
+
+	bufReader := bufio.NewReader(conn)
+
+	cmd := BuildCardRFFrame(RFFrameTypeCommand, readerAddr, RFCmdSingleInventory, nil)
+	if _, err := conn.Write(cmd); err != nil {
+		return nil, fmt.Errorf("发送失败: %w", err)
+	}
+
+	resp, raw, err := ReadCardRFFrame(bufReader)
+	if err != nil {
+		log.Printf("  ✗ 未读到有效响应：%v（原始字节：%s）\n", err, FormatHex(raw))
+		return nil, nil
+	}
+
+	tlvs := ParseCardRFTLVs(resp.Params)
+	if len(tlvs) > 0 && tlvs[0].Type == RFTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
+		log.Printf("  ✗ 未读到卡（状态码 %02X）\n", tlvs[0].Value[0])
+		return nil, nil
+	}
+
+	cards := ExtractCardsFromTagTLVs(resp.Params)
+	if len(cards) == 0 {
+		log.Println("  ✗ 未读到卡")
+	} else {
+		log.Printf("  ✓ 读到 %d 张卡：%v\n", len(cards), cards)
+	}
+
+	sort.Strings(cards)
+	return cards, nil
 }

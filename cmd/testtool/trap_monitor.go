@@ -27,14 +27,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/pennwin-pt/rs485"
 	"io"
 	"net"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -359,129 +356,10 @@ func cardReaderLoop() {
 // 本文件只用到“主动盘存标签(0x22)”这一条指令：
 // 发送后设备读一次标签就停止，并在同一个响应帧里把状态和读到的标签数据都带回来，
 // 非常适合“按需查询当前有哪些卡”这种一次性查询场景。
-
-const (
-	rfFrameTypeCommand  byte = 0x00
-	rfFrameTypeResponse byte = 0x01
-	rfFrameTypeNotify   byte = 0x02
-
-	rfCmdSingleInventory byte = 0x22 // 主动盘存标签：读一次就停
-
-	rfTLVStatus    byte = 0x07 // 状态 TLV
-	rfTLVSingleTag byte = 0x50 // 单张标签 TLV（内部还嵌套 EPC/RSSI/Time 等 TLV）
-	rfTLVEPC       byte = 0x01 // EPC TLV，值就是卡号
-)
-
-// buildRFFrame 拼出一条完整的 CPH 协议帧（命令帧用 rfFrameTypeCommand）。
-func buildRFFrame(frameType byte, address uint16, frameCode byte, params []byte) []byte {
-	frame := make([]byte, 0, 8+len(params))
-	frame = append(frame, 'R', 'F', frameType, byte(address>>8), byte(address&0xFF), frameCode)
-	frame = append(frame, byte(len(params)>>8), byte(len(params)&0xFF))
-	frame = append(frame, params...)
-	frame = append(frame, rs485.CardRfChecksum(frame))
-	return frame
-}
-
-// rfFrame 是解析出来的一条 CPH 协议帧。
-type rfFrame struct {
-	FrameType byte
-	Address   uint16
-	FrameCode byte
-	Params    []byte
-}
-
-// readRFFrame 从连接里读取并校验一条完整的 CPH 协议帧。
-// 除了解析结果和 error，还会把目前为止实际读到的原始字节一并返回（哪怕解析失败/读取出错也会返回已读到的部分），
-// 方便调用方在打印调试信息时，无论成功失败都能看到“收到了什么”。
-func readRFFrame(reader *bufio.Reader) (*rfFrame, []byte, error) {
-	var raw []byte
-
-	header := make([]byte, 2)
-	n, err := io.ReadFull(reader, header)
-	raw = append(raw, header[:n]...)
-	if err != nil {
-		return nil, raw, err
-	}
-	if header[0] != 'R' || header[1] != 'F' {
-		return nil, raw, fmt.Errorf("帧头不是 RF：% X", header)
-	}
-
-	rest := make([]byte, 6) // FrameType(1) + Address(2) + FrameCode(1) + ParamLen(2)
-	n, err = io.ReadFull(reader, rest)
-	raw = append(raw, rest[:n]...)
-	if err != nil {
-		return nil, raw, err
-	}
-	paramLen := int(rest[4])<<8 | int(rest[5])
-
-	params := make([]byte, paramLen)
-	if paramLen > 0 {
-		n, err = io.ReadFull(reader, params)
-		raw = append(raw, params[:n]...)
-		if err != nil {
-			return nil, raw, err
-		}
-	}
-
-	checksumByte := make([]byte, 1)
-	n, err = io.ReadFull(reader, checksumByte)
-	raw = append(raw, checksumByte[:n]...)
-	if err != nil {
-		return nil, raw, err
-	}
-
-	full := append(append(header, rest...), params...)
-	if want := rs485.CardRfChecksum(full); want != checksumByte[0] {
-		return nil, raw, fmt.Errorf("校验和不匹配：期望 %02X 实际 %02X", want, checksumByte[0])
-	}
-
-	return &rfFrame{
-		FrameType: rest[0],
-		Address:   uint16(rest[1])<<8 | uint16(rest[2]),
-		FrameCode: rest[3],
-		Params:    params,
-	}, raw, nil
-}
-
-// rfTLV 是一条通用 TLV：1 字节类型 + 1 字节长度 + N 字节值。
-type rfTLV struct {
-	Type  byte
-	Value []byte
-}
-
-// parseRFTLVs 按 Type(1) Length(1) Value(N) 的格式顺序切出所有 TLV。
-func parseRFTLVs(data []byte) []rfTLV {
-	var out []rfTLV
-	i := 0
-	for i+2 <= len(data) {
-		t := data[i]
-		l := int(data[i+1])
-		i += 2
-		if i+l > len(data) {
-			break // 数据不完整，直接放弃剩余部分
-		}
-		out = append(out, rfTLV{Type: t, Value: data[i : i+l]})
-		i += l
-	}
-	return out
-}
-
-// extractCardsFromTagTLVs 从响应帧的参数里找出所有“单张标签 TLV(0x50)”，
-// 再从每一个里面取出 EPC TLV(0x01) 的值作为卡号（十六进制字符串）。
-func extractCardsFromTagTLVs(params []byte) []string {
-	var cards []string
-	for _, t := range parseRFTLVs(params) {
-		if t.Type != rfTLVSingleTag {
-			continue
-		}
-		for _, inner := range parseRFTLVs(t.Value) {
-			if inner.Type == rfTLVEPC {
-				cards = append(cards, strings.ToUpper(hex.EncodeToString(inner.Value)))
-			}
-		}
-	}
-	return cards
-}
+//
+// 🌟 组帧/解析这套协议的常量、结构体和函数（RFFrameType*、RFTLV*、BuildCardRFFrame、
+// ReadCardRFFrame、ParseCardRFTLVs、ExtractCardsFromTagTLVs）现在都下沉到了 rs485 库里
+// 并导出，这里不再重复实现，直接调用 rs485. 前缀的版本即可。
 
 // queryCardsFromReader 连接指定读卡器，发送“主动盘存标签(0x22)”指令查询一次，
 // 解析响应帧，返回当前读到的所有卡号（EPC，十六进制字符串，大写）。
@@ -501,7 +379,7 @@ func queryCardsFromReader(reader ReaderInfo) ([]string, error) {
 	// 使用 reader.Address：0x0000 是广播地址所有设备都会响应；如果 motorReaderMap
 	// 里给这台读卡器配置了非 0 的具体地址，则只有该地址的读卡器会响应，
 	// 便于同一网段/网口下有多台读卡器时做点对点查询。
-	cmd := buildRFFrame(rfFrameTypeCommand, reader.Address, rfCmdSingleInventory, nil)
+	cmd := rs485.BuildCardRFFrame(rs485.RFFrameTypeCommand, reader.Address, rs485.RFCmdSingleInventory, nil)
 	if debugTraffic {
 		fmt.Printf("[读卡线程][调试] → 地址=%04X 发送：%s\n", reader.Address, rs485.FormatHex(cmd))
 	}
@@ -509,7 +387,7 @@ func queryCardsFromReader(reader ReaderInfo) ([]string, error) {
 		return nil, fmt.Errorf("发送失败: %w", err)
 	}
 
-	resp, raw, err := readRFFrame(bufio.NewReader(conn))
+	resp, raw, err := rs485.ReadCardRFFrame(bufio.NewReader(conn))
 	if err != nil {
 		if debugTraffic {
 			fmt.Printf("[读卡线程][调试] ← 地址=%04X 收到（解析失败，共 %d 字节原始数据）：%s\n", reader.Address, len(raw), rs485.FormatHex(raw))
@@ -521,262 +399,23 @@ func queryCardsFromReader(reader ReaderInfo) ([]string, error) {
 		fmt.Printf("[读卡线程][调试] ← 地址=%04X 解析结果：FrameType=%02X FrameCode=%02X Params=%s\n",
 			reader.Address, resp.FrameType, resp.FrameCode, rs485.FormatHex(resp.Params))
 	}
-	if resp.FrameType != rfFrameTypeResponse {
-		return nil, fmt.Errorf("响应帧类型不符合预期：FrameType=%02X（期望响应帧 %02X）", resp.FrameType, rfFrameTypeResponse)
+	if resp.FrameType != rs485.RFFrameTypeResponse {
+		return nil, fmt.Errorf("响应帧类型不符合预期：FrameType=%02X（期望响应帧 %02X）", resp.FrameType, rs485.RFFrameTypeResponse)
 	}
 	// 注：协议文档里“主动盘存标签(0x22)”响应示例表格里的 FrameCode 写的是 0x21，
 	// 疑似文档笔误（前一节 0x21 表格的残留），这里不对 FrameCode 做硬性校验，
 	// 只要是响应帧就尝试解析，避免因为文档笔误误判失败。
 
 	// 响应参数里第一个 TLV 是状态(0x07)，之后跟着 0~N 个标签 TLV(0x50)。
-	tlvs := parseRFTLVs(resp.Params)
-	if len(tlvs) > 0 && tlvs[0].Type == rfTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
+	tlvs := rs485.ParseCardRFTLVs(resp.Params)
+	if len(tlvs) > 0 && tlvs[0].Type == rs485.RFTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
 		return nil, fmt.Errorf("读写器返回状态码 %02X（非成功）", tlvs[0].Value[0])
 	}
 
-	return extractCardsFromTagTLVs(resp.Params), nil
+	return rs485.ExtractCardsFromTagTLVs(resp.Params), nil
 }
 
-// QueryCardsVerbose 和 queryCardsFromReader 逻辑完全一致，
-// 区别是会把拼装的指令、读卡器返回的原始数据、TLV 解析的中间过程、
-// 最终提炼出的卡号都打印到终端，供命令行手动调试读卡器时使用。
-func QueryCardsVerbose(reader ReaderInfo, isDefault bool) ([]string, error) {
-	addr := ""
-	if isDefault {
-		addr = net.JoinHostPort(defaultHost, defaultCardReaderPort)
-	} else {
-		addr = net.JoinHostPort(reader.IP, reader.Port)
-	}
-	fmt.Printf("  → 连接读卡器 %s ...\n", addr)
-
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("连接失败: %w", err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(readerFrameTimeout)); err != nil {
-		return nil, err
-	}
-
-	cmd := buildRFFrame(rfFrameTypeCommand, reader.Address, rfCmdSingleInventory, nil)
-	fmt.Printf("  → 发送指令（地址=%04X）：%s\n", reader.Address, rs485.FormatHex(cmd))
-
-	if _, err := conn.Write(cmd); err != nil {
-		return nil, fmt.Errorf("发送失败: %w", err)
-	}
-
-	resp, raw, err := readRFFrame(bufio.NewReader(conn))
-	if err != nil {
-		fmt.Printf("  ← 收到原始数据（%d 字节，解析失败）：%s\n", len(raw), rs485.FormatHex(raw))
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	fmt.Printf("  ← 收到完整原始报文（%d 字节）：%s\n", len(raw), rs485.FormatHex(raw))
-	fmt.Printf("  ← 收到响应：FrameType=%02X Address=%04X FrameCode=%02X ParamLen=%d\n",
-		resp.FrameType, resp.Address, resp.FrameCode, len(resp.Params))
-	fmt.Printf("  ← 参数原始字节：%s\n", rs485.FormatHex(resp.Params))
-
-	if resp.FrameType != rfFrameTypeResponse {
-		return nil, fmt.Errorf("响应帧类型不符合预期：FrameType=%02X（期望响应帧 %02X）", resp.FrameType, rfFrameTypeResponse)
-	}
-
-	tlvs := parseRFTLVs(resp.Params)
-	fmt.Printf("  ← 解析出 %d 个顶层 TLV：\n", len(tlvs))
-	for _, t := range tlvs {
-		fmt.Printf("     - Type=%02X Len=%d Value=%s\n", t.Type, len(t.Value), rs485.FormatHex(t.Value))
-		if t.Type == rfTLVSingleTag {
-			for _, inner := range parseRFTLVs(t.Value) {
-				fmt.Printf("        · 内嵌 TLV Type=%02X Len=%d Value=%s\n", inner.Type, len(inner.Value), rs485.FormatHex(inner.Value))
-			}
-		}
-	}
-
-	if len(tlvs) > 0 && tlvs[0].Type == rfTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
-		return nil, fmt.Errorf("读写器返回状态码 %02X（非成功）", tlvs[0].Value[0])
-	}
-
-	cards := extractCardsFromTagTLVs(resp.Params)
-	fmt.Printf("  ← 提炼出的卡号（共 %d 张）：%v\n", len(cards), cards)
-
-	return cards, nil
-}
-
-// cardModeDuration / cardModePollInterval：card 命令的连续读卡参数——
-// 总共读 2 秒，期间每隔 50ms 发一次查询指令，最后统计命中/未命中次数。
-const cardModeDuration = 1 * time.Second
-const cardModePollInterval = 130 * time.Millisecond
-
-// QueryCardsRepeated 在 duration 时间内，每隔 interval 向读卡器发一次
-// “主动盘存标签(0x22)”指令，直到时间用完。期间只连接一次（复用同一个 TCP 连接
-// 和同一个 bufio.Reader，避免每次都重新握手，也避免残留的粘包字节被 bufio 缓冲区吞掉）。
-// 每次尝试打印一行简要结果（读到/没读到），结束后打印命中/未命中次数汇总，
-// 以及本轮一共读到过哪些卡号（去重，并统计每张卡被读到的次数）。
-func QueryCardsRepeated(tmpReader ReaderInfo, isDefault bool, readerAddr byte, duration, interval time.Duration) ([]string, error) {
-	addr := ""
-	if isDefault {
-		addr = net.JoinHostPort(defaultHost, defaultCardReaderPort)
-	} else {
-		addr = net.JoinHostPort(tmpReader.IP, tmpReader.Port)
-	}
-	fmt.Printf("  → 连接读卡器 %s ...\n", addr)
-
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("连接失败: %w", err)
-	}
-	defer conn.Close()
-
-	fmt.Printf("  → 开始连续读卡：共 %v，每 %v 查询一次\n", duration, interval)
-
-	bufReader := bufio.NewReader(conn)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	deadline := time.Now().Add(duration)
-	attempt := 0
-	hitCount := 0
-	missCount := 0
-	cardHitCounts := make(map[string]int)
-
-	for time.Now().Before(deadline) {
-		attempt++
-
-		if err := conn.SetDeadline(time.Now().Add(interval)); err != nil {
-			fmt.Printf("  [%3d] ✗ 设置超时失败：%v\n", attempt, err)
-			missCount++
-			<-ticker.C
-			continue
-		}
-
-		cmd := buildRFFrame(rfFrameTypeCommand, uint16(readerAddr), rfCmdSingleInventory, nil)
-		if _, err := conn.Write(cmd); err != nil {
-			fmt.Printf("  [%3d] ✗ 发送失败：%v\n", attempt, err)
-			missCount++
-			<-ticker.C
-			continue
-		}
-
-		resp, raw, err := readRFFrame(bufReader)
-		if err != nil {
-			fmt.Printf("  [%3d] ✗ 未读到有效响应：%v（原始字节：%s）\n", attempt, err, rs485.FormatHex(raw))
-			missCount++
-			<-ticker.C
-			continue
-		}
-
-		tlvs := parseRFTLVs(resp.Params)
-		if len(tlvs) > 0 && tlvs[0].Type == rfTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
-			fmt.Printf("  [%3d] ✗ 未读到卡（状态码 %02X）\n", attempt, tlvs[0].Value[0])
-			missCount++
-			<-ticker.C
-			continue
-		}
-
-		cards := extractCardsFromTagTLVs(resp.Params)
-		if len(cards) == 0 {
-			fmt.Printf("  [%3d] ✗ 未读到卡\n", attempt)
-			missCount++
-		} else {
-			hitCount++
-			fmt.Printf("  [%3d] ✓ 读到 %d 张卡：%v\n", attempt, len(cards), cards)
-			for _, c := range cards {
-				cardHitCounts[c]++
-			}
-		}
-
-		<-ticker.C
-	}
-
-	fmt.Println("  ────────── 汇总 ──────────")
-	fmt.Printf("  共查询 %d 次，读到卡 %d 次，未读到卡 %d 次\n", attempt, hitCount, missCount)
-
-	uniqueCards := make([]string, 0, len(cardHitCounts))
-	for c := range cardHitCounts {
-		uniqueCards = append(uniqueCards, c)
-	}
-	sort.Strings(uniqueCards)
-
-	if len(uniqueCards) == 0 {
-		fmt.Println("  本轮未读到任何卡号")
-	} else {
-		fmt.Printf("  本轮共读到 %d 张不同的卡：\n", len(uniqueCards))
-		for _, c := range uniqueCards {
-			fmt.Printf("     %s  命中 %d 次\n", c, cardHitCounts[c])
-		}
-	}
-
-	return uniqueCards, nil
-}
-
-// QueryCardsOnce 只读一次：连接读卡器，发送一次"主动盘存标签(0x22)"指令，
-// 读取一次响应并解析出卡号列表，不重试、不轮询，读完（无论命中与否）立即返回。
-// 与 QueryCardsRepeated 的区别：后者在 duration 时间内每隔 interval 反复查询，
-// 这里只发一次、只读一次。
-func QueryCardsOnce(tmpReader ReaderInfo, isDefault bool, readerAddr uint16) ([]string, error) {
-	addr := ""
-	if isDefault {
-		addr = net.JoinHostPort(defaultHost, defaultCardReaderPort)
-	} else {
-		addr = net.JoinHostPort(tmpReader.IP, tmpReader.Port)
-	}
-	fmt.Printf("  → 连接读卡器 %s ...\n", addr)
-
-	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("连接失败: %w", err)
-	}
-	defer conn.Close()
-
-	fmt.Println("  → 只读一次（发送一次查询指令，读取一次响应）")
-
-	if err := conn.SetDeadline(time.Now().Add(readTimeout)); err != nil {
-		return nil, fmt.Errorf("设置超时失败: %w", err)
-	}
-
-	bufReader := bufio.NewReader(conn)
-
-	cmd := buildRFFrame(rfFrameTypeCommand, readerAddr, rfCmdSingleInventory, nil)
-	if _, err := conn.Write(cmd); err != nil {
-		return nil, fmt.Errorf("发送失败: %w", err)
-	}
-
-	resp, raw, err := readRFFrame(bufReader)
-	if err != nil {
-		fmt.Printf("  ✗ 未读到有效响应：%v（原始字节：%s）\n", err, rs485.FormatHex(raw))
-		printSingleReadSummary(nil)
-		return nil, nil
-	}
-
-	tlvs := parseRFTLVs(resp.Params)
-	if len(tlvs) > 0 && tlvs[0].Type == rfTLVStatus && len(tlvs[0].Value) > 0 && tlvs[0].Value[0] != 0x00 {
-		fmt.Printf("  ✗ 未读到卡（状态码 %02X）\n", tlvs[0].Value[0])
-		printSingleReadSummary(nil)
-		return nil, nil
-	}
-
-	cards := extractCardsFromTagTLVs(resp.Params)
-	if len(cards) == 0 {
-		fmt.Println("  ✗ 未读到卡")
-	} else {
-		fmt.Printf("  ✓ 读到 %d 张卡：%v\n", len(cards), cards)
-	}
-
-	sort.Strings(cards)
-	printSingleReadSummary(cards)
-	return cards, nil
-}
-
-// printSingleReadSummary 打印"只读一次"模式的汇总信息，cards 为空时表示未读到任何卡。
-func printSingleReadSummary(cards []string) {
-	fmt.Println("  ────────── 汇总 ──────────")
-	if len(cards) == 0 {
-		fmt.Println("  共查询 1 次，读到卡 0 次，未读到卡 1 次")
-		fmt.Println("  本轮未读到任何卡号")
-		return
-	}
-	fmt.Println("  共查询 1 次，读到卡 1 次，未读到卡 0 次")
-	fmt.Printf("  本轮共读到 %d 张不同的卡：\n", len(cards))
-	for _, c := range cards {
-		fmt.Printf("     %s\n", c)
-	}
-}
+// 🌟 QueryCardsVerbose / QueryCardsRepeated / QueryCardsOnce（连续/单次读卡查询、
+// 打印命中汇总）原来在这里各自实现了一份，现在统一改用 rs485 库里导出的
+// rs485.QueryCardsRepeated / rs485.QueryCardsOnce（见 rs485_debugger.go 的调用），
+// 这里不再重复维护。
