@@ -13,13 +13,12 @@
 //	motorPort               继电器端口，默认 defaultMotorPort
 //	readerIP / readerHost   RFID 读卡器主机地址；不单独指定时，默认和 motorIP 用同一个主机
 //	readerPort              RFID 读卡器端口，默认 defaultReaderPort
-//	delaySeconds / delay    组合/verify 模式里"保持"多少秒后自动发送关闭指令，默认 defaultDelaySeconds
+//	delaySeconds / delay    verify 模式里"保持"多少秒后自动发送关闭指令，默认 defaultDelaySeconds
 //
 // 启动后进入循环：每一轮先选择本轮要用的模式：
 //
-//	· 直接回车（或输入 1）  → 组合指令模式：依次输入开启/关闭两组指令，
-//	  自动执行 发送开启 → 倒计时等待 → 发送关闭 的完整流程。
-//	· 输入 2 或 s           → 单个指令模式：输入一条指令并立即发送一次。
+//	· 直接回车              → 单个指令模式：接着输入一条 6 字节十六进制指令，
+//	  程序自动计算 CRC-16 并追加，立即发送一次。
 //	· 输入 up                → 01 路 开→关：输入后再输入十进制设备地址（如 0、1、5 均可），
 //	  对该地址执行 开(XX 05 00 01 01 FF) → 关(XX 05 00 01 01 00)。
 //	· 输入 down              → 02 路 开→关：输入后再输入十进制设备地址（如 0、1、5 均可），
@@ -78,8 +77,7 @@ var (
 type runMode int
 
 const (
-	modeCombo       runMode = iota // 组合指令模式：开启 → 等待 → 关闭
-	modeSingle                     // 单个指令模式：发送一条指令
+	modeSingle      runMode = iota // 单个指令模式：直接回车触发，输入一条指令并发送一次
 	modeQuit                       // 退出程序
 	modeUp                         // 01 路开→关：交互式输入十进制设备地址，可对任意地址下发
 	modeDown                       // 02 路开→关：交互式输入十进制设备地址，可对任意地址下发
@@ -114,15 +112,9 @@ func main() {
 			fmt.Println("已退出。")
 			return
 
-		case modeCombo:
-			fmt.Println("\n【组合指令模式】请依次输入两组指令：")
-			openPayload := promptForCommand(scanner, "第 1 组【开启】")
-			closePayload := promptForCommand(scanner, "第 2 组【关闭】")
-			runOpenCloseSequence(addr, openPayload, closePayload, delaySeconds)
-
 		case modeSingle:
-			fmt.Println("\n【单个指令模式】请输入要发送的一条指令：")
-			payload := promptForCommand(scanner, "单条")
+			fmt.Println("\n【单个指令模式】")
+			payload := promptForCommand(scanner)
 			sendAndPrint(addr, "指令", payload)
 
 		case modeUp:
@@ -368,10 +360,9 @@ func promptForCardAddress(scanner *bufio.Scanner) int {
 func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 	fmt.Println("\n----------------------------------------")
 	fmt.Println("请选择本轮运行模式：")
-	fmt.Println("  直接回车 或 1  → 组合指令模式（开启/关闭两组指令，自动 开→等待→关）")
-	fmt.Println("  2 或 s         → 单个指令模式（输入一条指令，立即发送一次）")
-	fmt.Println("  up             → 01 路 开→关：输入后再输入十进制设备地址（如 0/1/5），对该地址执行 开(XX 05 00 01 01 FF) → 关(XX 05 00 01 01 00)；也可以直接输入 \"up 5\" 一次带上地址")
-	fmt.Println("  down           → 02 路 开→关：输入后再输入十进制设备地址（如 0/1/5），对该地址执行 开(XX 05 00 01 02 FF) → 关(XX 05 00 01 02 00)；也可以直接输入 \"down 5\" 一次带上地址")
+	fmt.Println("  直接回车         → 单个指令模式：接着输入一条 6 字节十六进制指令（如 05 05 00 01 01 FF），程序自动计算 CRC-16 并立即发送一次")
+	fmt.Println("  up             → M1 开→关：输入后再输入十进制设备地址（如 0/1/5），对该地址执行 开(XX 05 00 01 01 FF) → 关(XX 05 00 01 01 00)；也可以直接输入 \"up 5\" 一次带上地址")
+	fmt.Println("  down           → M2 开→关：输入后再输入十进制设备地址（如 0/1/5），对该地址执行 开(XX 05 00 01 02 FF) → 关(XX 05 00 01 02 00)；也可以直接输入 \"down 5\" 一次带上地址")
 	fmt.Println("  check          → 查询状态：输入后再输入十进制设备地址（如 0/1/5），对该地址发送查询状态指令 XX 02 00 02 00 05；也可以直接输入 \"check 5\" 一次带上地址")
 	fmt.Println("  card           → 读卡模式：输入后再输入十进制设备地址（如 0/1/5），连续读卡2秒（每50ms查询一次）并汇总命中/未命中次数；也可以直接输入 \"card 5\" 一次带上地址")
 	fmt.Println("  card1          → 只读一次模式：用法同 card，只发送并读取一次查询指令，不做2秒轮询；也可以直接输入 \"card1 5\" 一次带上地址")
@@ -387,7 +378,7 @@ func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 
 	fields := strings.Fields(scanner.Text())
 	if len(fields) == 0 {
-		return modeCombo, -1
+		return modeSingle, -1
 	}
 	choice := strings.ToLower(fields[0])
 
@@ -401,10 +392,6 @@ func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 	}
 
 	switch choice {
-	case "1":
-		return modeCombo, presetAddr
-	case "2", "s", "single":
-		return modeSingle, presetAddr
 	case "up":
 		return modeUp, presetAddr
 	case "down":
@@ -422,8 +409,8 @@ func promptForMode(scanner *bufio.Scanner) (runMode, int) {
 	case "q", "quit", "exit":
 		return modeQuit, presetAddr
 	default:
-		fmt.Println("  提示：无法识别的选项，已按默认的组合指令模式处理。")
-		return modeCombo, -1
+		fmt.Println("  提示：无法识别的选项，已按默认的单个指令模式处理。")
+		return modeSingle, -1
 	}
 }
 
@@ -438,10 +425,11 @@ func resolveAddress(scanner *bufio.Scanner, presetAddr int, prompt func(*bufio.S
 	return prompt(scanner)
 }
 
-// promptForCommand 反复提示用户输入一条十六进制指令，直到格式合法为止，返回已附加 CRC 的完整报文。
-func promptForCommand(scanner *bufio.Scanner, label string) []byte {
+// promptForCommand 反复提示用户输入一条十六进制指令，直到格式合法为止；
+// 用户只需要输入 6 字节数据本身，CRC-16 由程序自动计算并追加，返回的是已带 CRC 的完整报文。
+func promptForCommand(scanner *bufio.Scanner) []byte {
 	for {
-		fmt.Printf("%s指令（十六进制）> ", label)
+		fmt.Print("请输入指令（十六进制，6 字节，CRC 自动计算无需输入）> ")
 		if !scanner.Scan() {
 			fmt.Println("\n输入中断，程序退出。")
 			os.Exit(0)
@@ -456,7 +444,7 @@ func promptForCommand(scanner *bufio.Scanner, label string) []byte {
 		payload, err := buildPayloadWithCRC(line)
 		if err != nil {
 			fmt.Printf("  ✗ 指令格式有误：%v\n", err)
-			fmt.Println("  示例：05 05 00 01 01 FF  或  0505000101FF（固定 6 字节，CRC 自动追加）")
+			fmt.Println("  示例：05 05 00 01 01 FF  或  0505000101FF（固定 6 字节，CRC 自动追加，不需要自己算）")
 			continue
 		}
 		return payload
@@ -512,12 +500,11 @@ func printBanner(addr string, delaySeconds int) {
 	fmt.Printf("关闭延时：%d 秒\n", delaySeconds)
 	fmt.Println()
 	fmt.Println("使用说明：")
-	fmt.Println("  · 每一轮都会先让你选择模式（直接回车 = 组合指令模式）")
-	fmt.Println("  · 组合指令模式：输入【开启】【关闭】两组指令（各 6 字节十六进制）")
-	fmt.Println("    自动执行：发送开启 → 倒计时等待 → 发送关闭")
-	fmt.Println("  · 单个指令模式：输入一条指令，立即发送一次")
-	fmt.Println("  · up：01 路 开→关，输入后再输入十进制设备地址（任意地址均可）")
-	fmt.Println("  · down：02 路 开→关，输入后再输入十进制设备地址（任意地址均可）")
+	fmt.Println("  · 每一轮都会先让你选择模式（直接回车 = 单个指令模式）")
+	fmt.Println("  · 单个指令模式：只需输入一条 6 字节十六进制指令，CRC-16 由程序自动计算并追加，立即发送一次")
+	fmt.Println("    示例：05 05 00 01 01 FF（支持带空格）或 0505000101FF（不带空格均可）")
+	fmt.Println("  · up：M1 开→关，输入后再输入十进制设备地址（任意地址均可）")
+	fmt.Println("  · down：M2 路 开→关，输入后再输入十进制设备地址（任意地址均可）")
 	fmt.Println("  · check：查询状态，输入后再输入十进制设备地址（任意地址均可），发送查询状态指令 XX 02 00 02 00 05")
 	fmt.Println("  · card：读卡模式，输入后再输入十进制设备地址（如 0/1/5），连续读卡2秒（每50ms查询一次）并汇总命中/未命中次数")
 	fmt.Println("  · card1：只读一次模式，用法同 card，只发送并读取一次查询指令，不做2秒轮询")
@@ -526,10 +513,7 @@ func printBanner(addr string, delaySeconds int) {
 	fmt.Println("    └─ 主动模式（0）：上电后自动盘寻，接收指令可继续或停止")
 	fmt.Println("    └─ 被动模式（1）：上电后不盘寻，接收指令后盘寻一次并停止")
 	fmt.Println("    └─ 触发模式（2）：只有触发线有信号时才读卡")
-	fmt.Println("  · 组合/单个指令模式：程序会自动计算 CRC-16 并追加到末尾（共发送 8 字节），支持带空格：05 05 00 01 01 FF，也支持无空格：0505000101FF")
 	fmt.Println("  · up/down/check/card/card1/verify/mode 里的设备地址统一用【十进制】输入（如 0、1、5、17）")
-	fmt.Println("  · 【新】up/down/check/card/card1/verify/mode 都可以在选模式那一行直接带上地址，比如 \"up 5\"，")
-	fmt.Println("    不用再回车确认模式后单独输一次地址；不带地址就还是老样子，回车后再提示输入")
 	fmt.Println("  · 在模式选择处输入 quit / exit / q 可退出程序")
 	fmt.Println("========================================")
 }
