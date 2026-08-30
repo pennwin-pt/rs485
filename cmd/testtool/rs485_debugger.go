@@ -279,11 +279,6 @@ func runVerifiedChannel(addr string, scanner *bufio.Scanner, delaySeconds int, p
 func runPresetCard(presetName string, deviceAddr byte) {
 	fmt.Printf("\n【预设：%s】连续查询地址码 0x%02X 对应读卡器的卡号列表：\n", presetName, deviceAddr)
 	ip, port := defaultHost, defaultCardReaderPort
-	if reader, ok := motorReaderMap[deviceAddr]; ok {
-		ip, port = reader.IP, reader.Port
-	} else {
-		fmt.Printf("  ✗ motorReaderMap 里没有配置地址码 0x%02X 对应的读卡器信息。使用默认值 %s\n", deviceAddr, defaultTarget)
-	}
 	if _, err := rs485.QueryCardsRepeated(uint16(deviceAddr), ip, port, cardModeDuration, cardModePollInterval); err != nil {
 		fmt.Printf("  ✗ 查询失败：%v\n", err)
 	}
@@ -313,11 +308,6 @@ func runCardMode(scanner *bufio.Scanner, presetAddr int) {
 func runPresetCardOnce(presetName string, deviceAddr byte) {
 	fmt.Printf("\n【预设：%s】只读一次地址码 0x%02X 对应读卡器的卡号：\n", presetName, deviceAddr)
 	ip, port := defaultHost, defaultCardReaderPort
-	if reader, ok := motorReaderMap[deviceAddr]; ok {
-		ip, port = reader.IP, reader.Port
-	} else {
-		fmt.Printf("  ✗ motorReaderMap 里没有配置地址码 0x%02X 对应的读卡器信息。使用默认值 %s\n", deviceAddr, defaultTarget)
-	}
 	if _, err := rs485.QueryCardsOnce(uint16(deviceAddr), ip, port); err != nil {
 		fmt.Printf("  ✗ 查询失败：%v\n", err)
 	}
