@@ -633,7 +633,7 @@ func runSetWorkMode(addr string, scanner *bufio.Scanner) {
 	// 构建CPH协议帧
 	frame := buildRFWorkModeFrame(uint16(deviceAddr), byte(workMode))
 
-	fmt.Printf("\n→ 向设备 0x%04X 发送设置命令，工作模式 %d...\n", deviceAddr, workMode)
+	fmt.Printf("\n→ 向设备 %d(0x%04X) 发送设置命令，工作模式 %d...\n", deviceAddr, deviceAddr, workMode)
 	fmt.Printf("  发送帧（%d 字节）：%s\n", len(frame), rs485.FormatHex(frame))
 
 	resp, err := sendAndReceive(addr, frame)
@@ -708,8 +708,8 @@ func promptForDeviceAddress(scanner *bufio.Scanner) int {
 			continue
 		}
 
-		if addr < 0 || addr > 0xFFFF {
-			fmt.Println("✗ 地址范围应为 0 ~ 65535")
+		if addr < 0 || addr > 0xFF {
+			fmt.Println("✗ 地址范围应为 0 ~ 255")
 			continue
 		}
 
