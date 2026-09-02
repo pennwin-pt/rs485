@@ -616,7 +616,7 @@ func QueryCardsRepeated(readerAddr uint16, readerIP, readerPort string, duration
 		log.Printf("  本轮共读到 %d 张不同的卡：\n", len(uniqueCards))
 		for _, c := range uniqueCards {
 			hits := cardHitCounts[c]
-			fmt.Printf("     %s  命中 %d 次\n", c, hits)
+			log.Printf("     %s  命中 %d 次", c, hits)
 		}
 	}
 	return cardHitCounts, nil
